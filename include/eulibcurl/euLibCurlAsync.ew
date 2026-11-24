@@ -1,0 +1,1707 @@
+-- =============================================================================
+-- euLibCurlAsync.ew - Non-blocking async HTTP/download sub-library
+--                     for OpenEuphoria 4.1+ built on libcurl curl_multi
+--
+-- Dispatches downloads and HTTP requests (GET, POST, PUT, PATCH, DELETE,
+-- HEAD, multipart/form-data) into memory or directly to disk without blocking
+-- the main script, with real-time progress/status queries, auto-pump, FIFO
+-- concurrency queue, pause/resume/cancel, callbacks, and optional std/task.e support.
+-- =============================================================================
+
+namespace curl_async
+
+public include eulibcurl/euLibCurl.ew as curl
+
+include std/error.e
+include std/io.e
+include std/machine.e
+include std/map.e
+include std/os.e
+include std/sequence.e
+include std/text.e
+include std/types.e
+
+ifdef not EUC_DLL then
+    include std/task.e
+end ifdef
+
+-- =============================================================================
+-- Public Constants and Enums
+-- =============================================================================
+
+public enum
+    ASYNC_STATUS_PENDING = 1,
+    ASYNC_STATUS_RUNNING,
+    ASYNC_STATUS_PAUSED,
+    ASYNC_STATUS_DONE,
+    ASYNC_STATUS_ERROR,
+    ASYNC_STATUS_CANCELLED
+
+public enum
+    INFO_ID = 1,
+    INFO_STATUS,
+    INFO_METHOD,
+    INFO_URL,
+    INFO_EFFECTIVE_URL,
+    INFO_HTTP_CODE,
+    INFO_CURL_CODE,
+    INFO_ERROR,
+    INFO_DL_NOW,
+    INFO_DL_TOTAL,
+    INFO_DL_PERCENT,
+    INFO_DL_SPEED,
+    INFO_UL_NOW,
+    INFO_UL_TOTAL,
+    INFO_UL_PERCENT,
+    INFO_UL_SPEED,
+    INFO_ELAPSED,
+    INFO_CONTENT_TYPE,
+    INFO_HEADERS,
+    INFO_OUTPUT_FILE,
+    INFO_BODY_SIZE
+
+public enum
+    PROG_DL_NOW = 1,
+    PROG_DL_TOTAL,
+    PROG_DL_PERCENT,
+    PROG_DL_SPEED,
+    PROG_UL_NOW,
+    PROG_UL_TOTAL,
+    PROG_UL_PERCENT,
+    PROG_UL_SPEED,
+    PROG_ELAPSED
+
+public enum
+    RESP_STATUS = 1,
+    RESP_CURL_CODE,
+    RESP_HTTP_CODE,
+    RESP_BODY,
+    RESP_HEADERS,
+    RESP_ERROR
+
+-- Internal layout of each request record in the map
+enum
+    REQ_ID = 1,
+    REQ_EASY,
+    REQ_STATUS,
+    REQ_METHOD,
+    REQ_URL,
+    REQ_EFFECTIVE_URL,
+    REQ_HTTP_CODE,
+    REQ_CURL_CODE,
+    REQ_ERROR,
+    REQ_ERRBUF,
+    REQ_BODY,
+    REQ_BODY_SIZE,
+    REQ_HEADERS,
+    REQ_SLIST,
+    REQ_MIME,
+    REQ_OUTPUT_FILE,
+    REQ_FILE_HANDLE,
+    REQ_DL_NOW,
+    REQ_DL_TOTAL,
+    REQ_DL_SPEED,
+    REQ_UL_NOW,
+    REQ_UL_TOTAL,
+    REQ_UL_SPEED,
+    REQ_START_TIME,
+    REQ_ELAPSED,
+    REQ_CONTENT_TYPE,
+    REQ_ON_PROGRESS,
+    REQ_ON_CHUNK,
+    REQ_ON_COMPLETE,
+    REQ_USER_DATA,
+    REQ_ABORT_FLAG,
+    REQ_CANCEL_FLAG,
+    REQ_IN_MULTI,
+    REQ_OPTS,
+    REQ_RESUME_FROM,
+    REQ_FILE_OPEN_ERR,
+    REQ_SIZE
+
+-- =============================================================================
+-- Global Async Manager State
+-- =============================================================================
+
+integer initialized = 0
+atom multi_handle = 0
+integer next_req_id = 1
+integer in_poll = 0
+integer max_concurrent = 0
+sequence pending_queue = {}
+sequence deferred_callbacks = {}
+map requests = map:new()
+map easy_to_id = map:new()
+
+ifdef not EUC_DLL then
+    atom bg_task_id = -1
+    integer bg_task_active = 0
+end ifdef
+
+-- =============================================================================
+-- Internal Utilities
+-- =============================================================================
+
+function kv_set(sequence kv, sequence key, object val)
+    for i = 1 to length(kv) do
+        if equal(kv[i][1], key) then
+            kv[i][2] = val
+            return kv
+        end if
+    end for
+    return append(kv, {key, val})
+end function
+
+function kv_has(sequence kv, sequence key)
+    for i = 1 to length(kv) do
+        if equal(kv[i][1], key) then
+            return 1
+        end if
+    end for
+    return 0
+end function
+
+function kv_get(sequence kv, sequence key, object def_val = 0)
+    for i = 1 to length(kv) do
+        if equal(kv[i][1], key) then
+            return kv[i][2]
+        end if
+    end for
+    return def_val
+end function
+
+function normalize_opts_kv(object opts)
+    sequence kv = {}
+    if map:map(opts) then
+        return map:pairs(opts)
+    end if
+    if sequence(opts) then
+        for i = 1 to length(opts) do
+            if sequence(opts[i]) and length(opts[i]) >= 2 then
+                kv = kv_set(kv, opts[i][1], opts[i][2])
+            end if
+        end for
+    end if
+    return kv
+end function
+
+procedure fire_callbacks(sequence cb_list)
+    for i = 1 to length(cb_list) do
+        if not initialized then
+            exit
+        end if
+        sequence cb = cb_list[i]
+        call_proc(cb[3], {cb[1], cb[2]})
+    end for
+end procedure
+
+function calc_percent(atom now_bytes, atom total_bytes)
+    if total_bytes <= 0 then
+        return -1
+    end if
+    atom pct = (now_bytes * 100.0) / total_bytes
+    if pct < 0 then
+        pct = 0
+    elsif pct > 100.0 then
+        pct = 100.0
+    end if
+    return pct
+end function
+
+function build_progress_seq(sequence req)
+    atom elapsed = req[REQ_ELAPSED]
+    if req[REQ_STATUS] = ASYNC_STATUS_RUNNING or req[REQ_STATUS] = ASYNC_STATUS_PAUSED then
+        elapsed = time() - req[REQ_START_TIME]
+    end if
+    atom dl_speed = req[REQ_DL_SPEED]
+    atom ul_speed = req[REQ_UL_SPEED]
+    if dl_speed <= 0 and elapsed > 0 and req[REQ_DL_NOW] > 0 then
+        dl_speed = req[REQ_DL_NOW] / elapsed
+    end if
+    if ul_speed <= 0 and elapsed > 0 and req[REQ_UL_NOW] > 0 then
+        ul_speed = req[REQ_UL_NOW] / elapsed
+    end if
+    return {
+        req[REQ_DL_NOW],
+        req[REQ_DL_TOTAL],
+        calc_percent(req[REQ_DL_NOW], req[REQ_DL_TOTAL]),
+        dl_speed,
+        req[REQ_UL_NOW],
+        req[REQ_UL_TOTAL],
+        calc_percent(req[REQ_UL_NOW], req[REQ_UL_TOTAL]),
+        ul_speed,
+        elapsed
+    }
+end function
+
+function get_req(integer req_id)
+    object req = map:get(requests, req_id, 0)
+    if atom(req) then
+        return 0
+    end if
+    return req
+end function
+
+procedure put_req(integer req_id, sequence req)
+    map:put(requests, req_id, req)
+end procedure
+
+procedure close_req_file(sequence req)
+    integer fn = req[REQ_FILE_HANDLE]
+    if fn != -1 then
+        close(fn)
+    end if
+end procedure
+
+function open_req_output_file(sequence req)
+    sequence mode = "wb"
+    if req[REQ_RESUME_FROM] > 0 then
+        mode = "ab"
+    end if
+    return open(req[REQ_OUTPUT_FILE], mode)
+end function
+
+procedure cleanup_req_native(sequence req)
+    atom eh = req[REQ_EASY]
+    if eh != 0 then
+        if req[REQ_IN_MULTI] and multi_handle != 0 then
+            curl:curl_multi_remove_handle(multi_handle, eh)
+        end if
+        map:remove(easy_to_id, eh)
+        curl:curl_easy_cleanup(eh)
+    end if
+    if req[REQ_SLIST] != 0 then
+        curl:curl_slist_free_all(req[REQ_SLIST])
+    end if
+    if req[REQ_MIME] != 0 then
+        curl:curl_mime_free(req[REQ_MIME])
+    end if
+    if req[REQ_ERRBUF] != 0 then
+        free(req[REQ_ERRBUF])
+    end if
+end procedure
+
+procedure refresh_live_easy_info(integer req_id)
+    if in_poll then
+        return
+    end if
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return
+    end if
+    sequence req = maybe
+    atom eh = req[REQ_EASY]
+    if eh = 0 then
+        return
+    end if
+
+    sequence r = curl:curl_easy_getinfo(eh, curl:CURLINFO_RESPONSE_CODE)
+    if r[1] = curl:CURLE_OK and r[2] > 0 then
+        req[REQ_HTTP_CODE] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_EFFECTIVE_URL)
+    if r[1] = curl:CURLE_OK and length(r[2]) > 0 then
+        req[REQ_EFFECTIVE_URL] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_CONTENT_TYPE)
+    if r[1] = curl:CURLE_OK and length(r[2]) > 0 then
+        req[REQ_CONTENT_TYPE] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_SPEED_DOWNLOAD_T)
+    if r[1] = curl:CURLE_OK and r[2] >= 0 then
+        req[REQ_DL_SPEED] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_SPEED_UPLOAD_T)
+    if r[1] = curl:CURLE_OK and r[2] >= 0 then
+        req[REQ_UL_SPEED] = r[2]
+    end if
+    req[REQ_ELAPSED] = time() - req[REQ_START_TIME]
+    put_req(req_id, req)
+end procedure
+
+function finalize_transfer(atom eh, integer curl_code)
+    integer req_id = map:get(easy_to_id, eh, 0)
+    if req_id = 0 then
+        return {}
+    end if
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return {}
+    end if
+    sequence req = maybe
+
+    -- Collect final metadata before removing/cleaning up the easy handle
+    sequence r = curl:curl_easy_getinfo(eh, curl:CURLINFO_RESPONSE_CODE)
+    if r[1] = curl:CURLE_OK then
+        req[REQ_HTTP_CODE] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_EFFECTIVE_URL)
+    if r[1] = curl:CURLE_OK and length(r[2]) > 0 then
+        req[REQ_EFFECTIVE_URL] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_CONTENT_TYPE)
+    if r[1] = curl:CURLE_OK and length(r[2]) > 0 then
+        req[REQ_CONTENT_TYPE] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_SIZE_DOWNLOAD_T)
+    if r[1] = curl:CURLE_OK and r[2] > req[REQ_DL_NOW] then
+        req[REQ_DL_NOW] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_CONTENT_LENGTH_DOWNLOAD_T)
+    if r[1] = curl:CURLE_OK and r[2] > 0 then
+        req[REQ_DL_TOTAL] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_SPEED_DOWNLOAD_T)
+    if r[1] = curl:CURLE_OK and r[2] >= 0 then
+        req[REQ_DL_SPEED] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_SIZE_UPLOAD_T)
+    if r[1] = curl:CURLE_OK and r[2] > req[REQ_UL_NOW] then
+        req[REQ_UL_NOW] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_CONTENT_LENGTH_UPLOAD_T)
+    if r[1] = curl:CURLE_OK and r[2] > 0 then
+        req[REQ_UL_TOTAL] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_SPEED_UPLOAD_T)
+    if r[1] = curl:CURLE_OK and r[2] >= 0 then
+        req[REQ_UL_SPEED] = r[2]
+    end if
+    r = curl:curl_easy_getinfo(eh, curl:CURLINFO_TOTAL_TIME)
+    if r[1] = curl:CURLE_OK and r[2] > 0 then
+        req[REQ_ELAPSED] = r[2]
+    else
+        req[REQ_ELAPSED] = time() - req[REQ_START_TIME]
+    end if
+
+    req[REQ_CURL_CODE] = curl_code
+    if req[REQ_CANCEL_FLAG] then
+        req[REQ_STATUS] = ASYNC_STATUS_CANCELLED
+        req[REQ_ERROR] = "Request cancelled by user"
+    elsif req[REQ_FILE_OPEN_ERR] then
+        req[REQ_STATUS] = ASYNC_STATUS_ERROR
+        req[REQ_CURL_CODE] = curl:CURLE_CANT_OPEN_FILE
+        req[REQ_ERROR] = "Unable to open output file: " & req[REQ_OUTPUT_FILE]
+    elsif curl_code = curl:CURLE_OK then
+        -- If the server succeeded with 0 bytes (e.g., Content-Length: 0 / HTTP 204),
+        -- create an empty file to faithfully reflect the server response (except HEAD).
+        if length(req[REQ_OUTPUT_FILE]) > 0 and req[REQ_FILE_HANDLE] = -1 and not equal(req[REQ_METHOD], "HEAD") then
+            integer empty_fn = open_req_output_file(req)
+            if empty_fn = -1 then
+                req[REQ_STATUS] = ASYNC_STATUS_ERROR
+                req[REQ_CURL_CODE] = curl:CURLE_CANT_OPEN_FILE
+                req[REQ_ERROR] = "Unable to open output file: " & req[REQ_OUTPUT_FILE]
+            else
+                close(empty_fn)
+                req[REQ_STATUS] = ASYNC_STATUS_DONE
+                req[REQ_ERROR] = ""
+            end if
+        else
+            req[REQ_STATUS] = ASYNC_STATUS_DONE
+            req[REQ_ERROR] = ""
+            if req[REQ_DL_TOTAL] <= 0 and req[REQ_DL_NOW] > 0 then
+                req[REQ_DL_TOTAL] = req[REQ_DL_NOW]
+            end if
+        end if
+    else
+        req[REQ_STATUS] = ASYNC_STATUS_ERROR
+        sequence err_msg = ""
+        if req[REQ_ERRBUF] != 0 then
+            err_msg = peek_string(req[REQ_ERRBUF])
+        end if
+        if length(err_msg) = 0 then
+            err_msg = curl:curl_easy_strerror(curl_code)
+        end if
+        req[REQ_ERROR] = err_msg
+    end if
+
+    close_req_file(req)
+    req[REQ_FILE_HANDLE] = -1
+
+    cleanup_req_native(req)
+    req[REQ_EASY] = 0
+    req[REQ_SLIST] = 0
+    req[REQ_MIME] = 0
+    req[REQ_ERRBUF] = 0
+    req[REQ_IN_MULTI] = 0
+
+    put_req(req_id, req)
+
+    if req[REQ_ON_COMPLETE] >= 0 then
+        return {req_id, req[REQ_STATUS], req[REQ_ON_COMPLETE]}
+    end if
+    return {}
+end function
+
+-- =============================================================================
+-- Internal libcurl CDECL Callbacks (instantiated once)
+-- =============================================================================
+
+function internal_write_cb(atom buf_ptr, atom sz, atom nmemb, atom req_id)
+    atom total = sz * nmemb
+    if total = 0 then
+        return 0
+    end if
+
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return 0
+    end if
+    sequence req = maybe
+
+    if req[REQ_ABORT_FLAG] or req[REQ_CANCEL_FLAG] then
+        return 0
+    end if
+
+    sequence chunk = peek({buf_ptr, total})
+
+    if length(req[REQ_OUTPUT_FILE]) > 0 then
+        integer fn = req[REQ_FILE_HANDLE]
+        if fn = -1 then
+            fn = open_req_output_file(req)
+            if fn = -1 then
+                req[REQ_FILE_OPEN_ERR] = 1
+                req[REQ_ABORT_FLAG] = 1
+                put_req(req_id, req)
+                return 0
+            end if
+            req[REQ_FILE_HANDLE] = fn
+        end if
+        puts(fn, chunk)
+    else
+        req[REQ_BODY] &= chunk
+    end if
+
+    req[REQ_BODY_SIZE] += total
+    if req[REQ_BODY_SIZE] > req[REQ_DL_NOW] then
+        req[REQ_DL_NOW] = req[REQ_BODY_SIZE]
+    end if
+    put_req(req_id, req)
+
+    integer chunk_cb = req[REQ_ON_CHUNK]
+    if chunk_cb >= 0 then
+        integer keep = call_func(chunk_cb, {req_id, chunk})
+        if not keep then
+            maybe = get_req(req_id)
+            if sequence(maybe) then
+                req = maybe
+                req[REQ_ABORT_FLAG] = 1
+                put_req(req_id, req)
+            end if
+            return 0
+        end if
+    end if
+
+    return total
+end function
+
+function internal_header_cb(atom buf_ptr, atom sz, atom nmemb, atom req_id)
+    atom total = sz * nmemb
+    if total = 0 then
+        return 0
+    end if
+
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return total
+    end if
+    sequence req = maybe
+
+    sequence line = peek({buf_ptr, total})
+    sequence trimmed = text:trim(line, "\r\n")
+
+    if length(trimmed) >= 5 and equal(trimmed[1..5], "HTTP/") then
+        -- New status line (e.g., after redirect): reset headers to reflect the final response
+        req[REQ_HEADERS] = {trimmed}
+    elsif length(trimmed) > 0 then
+        req[REQ_HEADERS] = append(req[REQ_HEADERS], trimmed)
+    end if
+
+    put_req(req_id, req)
+    return total
+end function
+
+function handle_xferinfo_update(atom req_id, atom dltotal, atom dlnow, atom ultotal, atom ulnow)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return 0
+    end if
+    sequence req = maybe
+
+    if req[REQ_ABORT_FLAG] or req[REQ_CANCEL_FLAG] then
+        return 1
+    end if
+
+    if dltotal >= 0 then
+        req[REQ_DL_TOTAL] = dltotal
+    end if
+    if dlnow > req[REQ_DL_NOW] then
+        req[REQ_DL_NOW] = dlnow
+    end if
+    if ultotal >= 0 then
+        req[REQ_UL_TOTAL] = ultotal
+    end if
+    if ulnow > req[REQ_UL_NOW] then
+        req[REQ_UL_NOW] = ulnow
+    end if
+    req[REQ_ELAPSED] = time() - req[REQ_START_TIME]
+    put_req(req_id, req)
+
+    integer prog_cb = req[REQ_ON_PROGRESS]
+    if prog_cb >= 0 then
+        integer keep = call_func(prog_cb, {req_id, build_progress_seq(req)})
+        if not keep then
+            maybe = get_req(req_id)
+            if sequence(maybe) then
+                req = maybe
+                req[REQ_ABORT_FLAG] = 1
+                put_req(req_id, req)
+            end if
+            return 1
+        end if
+    end if
+
+    return 0
+end function
+
+ifdef BITS32 then
+
+function u32_pair_to_s64(atom lo, atom hi)
+    if hi >= #80000000 then
+        hi -= #100000000
+    end if
+    return hi * #100000000 + lo
+end function
+
+function internal_xferinfo_cb(atom req_id,
+        atom dlt_lo, atom dlt_hi, atom dln_lo, atom dln_hi,
+        atom ult_lo, atom ult_hi, atom uln_lo, atom uln_hi)
+    return handle_xferinfo_update(
+        req_id,
+        u32_pair_to_s64(dlt_lo, dlt_hi),
+        u32_pair_to_s64(dln_lo, dln_hi),
+        u32_pair_to_s64(ult_lo, ult_hi),
+        u32_pair_to_s64(uln_lo, uln_hi)
+    )
+end function
+
+elsedef
+
+function internal_xferinfo_cb(atom req_id,
+        atom dltotal, atom dlnow, atom ultotal, atom ulnow)
+    return handle_xferinfo_update(req_id, dltotal, dlnow, ultotal, ulnow)
+end function
+
+end ifdef
+
+constant
+    CB_WRITE    = curl:curl_callback(routine_id("internal_write_cb")),
+    CB_HEADER   = curl:curl_callback(routine_id("internal_header_cb")),
+    CB_XFERINFO = curl:curl_callback(routine_id("internal_xferinfo_cb"))
+
+-- =============================================================================
+-- Async Manager Lifecycle and Concurrency Control
+-- =============================================================================
+
+function count_in_flight()
+    return map:size(easy_to_id)
+end function
+
+--**
+-- Sets the maximum number of requests running simultaneously in curl_multi.
+-- limit <= 0 means unlimited (all requests start immediately).
+-- Excess requests remain in the FIFO queue in ASYNC_STATUS_PENDING without opening
+-- output files, allocating easy handles, or starting timeout/elapsed timers.
+public procedure curl_async_set_max_concurrent(integer limit)
+    if limit < 0 then
+        limit = 0
+    end if
+    max_concurrent = limit
+
+    if initialized and multi_handle != 0 and not in_poll then
+        sequence pumped = pump_pending_queue()
+        fire_callbacks(pumped[2])
+        if pumped[1] > 0 then
+            curl_async_poll()
+        end if
+    end if
+end procedure
+
+--**
+-- Returns the current concurrency queue limit (0 = unlimited).
+public function curl_async_get_max_concurrent()
+    return max_concurrent
+end function
+
+--**
+-- Configures curl_multi connection limits and optionally the FIFO
+-- concurrency queue limit (max_concurrent_reqs >= 0; -1 keeps current value).
+public procedure curl_async_set_limits(integer max_total_conns = 0, integer max_host_conns = 0,
+        integer max_concurrent_reqs = -1)
+    if multi_handle != 0 then
+        if max_total_conns > 0 then
+            curl:curl_multi_setopt(multi_handle, curl:CURLMOPT_MAX_TOTAL_CONNECTIONS, max_total_conns)
+        end if
+        if max_host_conns > 0 then
+            curl:curl_multi_setopt(multi_handle, curl:CURLMOPT_MAX_HOST_CONNECTIONS, max_host_conns)
+        end if
+    end if
+    if max_concurrent_reqs >= 0 then
+        curl_async_set_max_concurrent(max_concurrent_reqs)
+    end if
+end procedure
+
+--**
+-- Initializes the async manager (called automatically on the first request if omitted).
+-- max_total_conns / max_host_conns configure curl_multi TCP connection limits.
+-- max_concurrent_reqs >= 0 configures the FIFO concurrency queue limit (0 = unlimited).
+public procedure curl_async_init(integer max_total_conns = 0, integer max_host_conns = 0,
+        integer max_concurrent_reqs = -1)
+    if initialized and multi_handle != 0 then
+        curl_async_set_limits(max_total_conns, max_host_conns, max_concurrent_reqs)
+        return
+    end if
+    integer grc = curl:curl_global_init(curl:CURL_GLOBAL_DEFAULT)
+    if grc != curl:CURLE_OK then
+        error:crash("curl_global_init failed with code %d: %s", {grc, curl:curl_easy_strerror(grc)})
+    end if
+    multi_handle = curl:curl_multi_init()
+    if multi_handle = 0 then
+        error:crash("curl_multi_init returned NULL", {})
+    end if
+    initialized = 1
+    curl_async_set_limits(max_total_conns, max_host_conns, max_concurrent_reqs)
+end procedure
+
+--**
+-- Stops the cooperative task (if active), cancels pending requests,
+-- releases all handles/files, and cleans up curl_multi and global state.
+public procedure curl_async_shutdown()
+    ifdef not EUC_DLL then
+        if bg_task_active and bg_task_id != -1 then
+            task_suspend(bg_task_id)
+            bg_task_active = 0
+            bg_task_id = -1
+        end if
+    end ifdef
+
+    sequence ids = map:keys(requests)
+    for i = 1 to length(ids) do
+        object maybe = get_req(ids[i])
+        if sequence(maybe) then
+            sequence req = maybe
+            close_req_file(req)
+            cleanup_req_native(req)
+        end if
+    end for
+
+    pending_queue = {}
+    deferred_callbacks = {}
+    max_concurrent = 0
+    map:clear(requests)
+    map:clear(easy_to_id)
+
+    if multi_handle != 0 then
+        curl:curl_multi_cleanup(multi_handle)
+        multi_handle = 0
+    end if
+
+    if initialized then
+        curl:curl_global_cleanup()
+        initialized = 0
+    end if
+end procedure
+
+-- =============================================================================
+-- Non-Blocking Pumping and Controlled Waiting
+-- =============================================================================
+
+function count_active_requests()
+    integer cnt = 0
+    sequence ids = map:keys(requests)
+    for i = 1 to length(ids) do
+        object maybe = get_req(ids[i])
+        if sequence(maybe) then
+            integer st = maybe[REQ_STATUS]
+            if st = ASYNC_STATUS_PENDING or st = ASYNC_STATUS_RUNNING or st = ASYNC_STATUS_PAUSED then
+                cnt += 1
+            end if
+        end if
+    end for
+    return cnt
+end function
+
+--**
+-- Runs one non-blocking step of curl_multi, promotes queued FIFO items
+-- as slots open, processes ready chunks, finalizes completed transfers,
+-- and invokes on_complete callbacks.
+-- Returns the number of still-active requests (running + paused + pending).
+public function curl_async_poll()
+    if not initialized or multi_handle = 0 then
+        return 0
+    end if
+    if in_poll then
+        return count_active_requests()
+    end if
+
+    in_poll = 1
+    sequence pending_callbacks = {}
+
+    -- Promote queued FIFO items if slots are available before perform
+    sequence pre_pump = pump_pending_queue()
+    if length(pre_pump[2]) > 0 then
+        pending_callbacks &= pre_pump[2]
+    end if
+
+    integer need_perform = (count_in_flight() > 0)
+    while need_perform do
+        need_perform = 0
+        curl:curl_multi_perform(multi_handle)
+
+        sequence msg = curl:curl_multi_info_read(multi_handle)
+        while length(msg) > 0 do
+            if msg[curl:MMSG_MSG] = curl:CURLMSG_DONE then
+                sequence cb_item = finalize_transfer(msg[curl:MMSG_EASY_HANDLE], msg[curl:MMSG_RESULT])
+                if length(cb_item) > 0 then
+                    pending_callbacks = append(pending_callbacks, cb_item)
+                end if
+            end if
+            msg = curl:curl_multi_info_read(multi_handle)
+        end while
+
+        -- If slots were freed, promote the next queued items immediately
+        -- and run another perform to start DNS/TCP without waiting for the next poll
+        sequence post_pump = pump_pending_queue()
+        if length(post_pump[2]) > 0 then
+            pending_callbacks &= post_pump[2]
+        end if
+        if post_pump[1] > 0 then
+            need_perform = 1
+        end if
+    end while
+
+    if length(deferred_callbacks) > 0 then
+        pending_callbacks &= deferred_callbacks
+        deferred_callbacks = {}
+    end if
+
+    in_poll = 0
+
+    fire_callbacks(pending_callbacks)
+
+    return count_active_requests()
+end function
+
+--**
+-- Waits up to timeout_ms for network activity via curl_multi_poll and calls curl_async_poll().
+-- Returns the number of still-active requests (running + paused + pending).
+public function curl_async_wait_step(integer timeout_ms = 50)
+    if not initialized or multi_handle = 0 then
+        return 0
+    end if
+    if in_poll then
+        return count_active_requests()
+    end if
+    if timeout_ms > 0 and count_in_flight() > 0 then
+        curl:curl_multi_poll(multi_handle, timeout_ms)
+    end if
+    return curl_async_poll()
+end function
+
+--**
+-- Immediately wakes a blocked curl_multi_poll / curl_async_wait_step call.
+public function curl_async_wakeup()
+    if not initialized or multi_handle = 0 then
+        return curl:CURLM_BAD_HANDLE
+    end if
+    return curl:curl_multi_wakeup(multi_handle)
+end function
+
+-- =============================================================================
+-- Async Request Creation and Configuration
+-- =============================================================================
+
+function new_req_record(integer req_id, sequence method, sequence url, sequence output_file)
+    sequence req = repeat(0, REQ_SIZE)
+    req[REQ_ID]            = req_id
+    req[REQ_EASY]          = 0
+    req[REQ_STATUS]        = ASYNC_STATUS_PENDING
+    req[REQ_METHOD]        = method
+    req[REQ_URL]           = url
+    req[REQ_EFFECTIVE_URL] = url
+    req[REQ_HTTP_CODE]     = 0
+    req[REQ_CURL_CODE]     = curl:CURLE_OK
+    req[REQ_ERROR]         = ""
+    req[REQ_ERRBUF]        = 0
+    req[REQ_BODY]          = ""
+    req[REQ_BODY_SIZE]     = 0
+    req[REQ_HEADERS]       = {}
+    req[REQ_SLIST]         = 0
+    req[REQ_MIME]          = 0
+    req[REQ_OUTPUT_FILE]   = output_file
+    req[REQ_FILE_HANDLE]   = -1
+    req[REQ_DL_NOW]        = 0
+    req[REQ_DL_TOTAL]      = -1
+    req[REQ_DL_SPEED]      = 0
+    req[REQ_UL_NOW]        = 0
+    req[REQ_UL_TOTAL]      = -1
+    req[REQ_UL_SPEED]      = 0
+    req[REQ_START_TIME]    = 0
+    req[REQ_ELAPSED]       = 0
+    req[REQ_CONTENT_TYPE]  = ""
+    req[REQ_ON_PROGRESS]   = -1
+    req[REQ_ON_CHUNK]      = -1
+    req[REQ_ON_COMPLETE]   = -1
+    req[REQ_USER_DATA]     = 0
+    req[REQ_ABORT_FLAG]    = 0
+    req[REQ_CANCEL_FLAG]   = 0
+    req[REQ_IN_MULTI]      = 0
+    req[REQ_OPTS]          = {}
+    req[REQ_RESUME_FROM]   = 0
+    req[REQ_FILE_OPEN_ERR] = 0
+    return req
+end function
+
+function fail_before_start(sequence req, integer curl_code, sequence err_msg)
+    req[REQ_STATUS]    = ASYNC_STATUS_ERROR
+    req[REQ_CURL_CODE] = curl_code
+    req[REQ_ERROR]     = err_msg
+    req[REQ_OPTS]      = {}
+    close_req_file(req)
+    req[REQ_FILE_HANDLE] = -1
+    cleanup_req_native(req)
+    req[REQ_EASY]   = 0
+    req[REQ_SLIST]  = 0
+    req[REQ_MIME]   = 0
+    req[REQ_ERRBUF] = 0
+    req[REQ_IN_MULTI] = 0
+    put_req(req[REQ_ID], req)
+    if req[REQ_ON_COMPLETE] >= 0 then
+        return {0, {req[REQ_ID], ASYNC_STATUS_ERROR, req[REQ_ON_COMPLETE]}}
+    end if
+    return {0, {}}
+end function
+
+function build_mime_form(atom eh, sequence form_items)
+    atom mime = curl:curl_mime_init(eh)
+    if mime = 0 then
+        return 0
+    end if
+
+    for i = 1 to length(form_items) do
+        sequence item = form_items[i]
+        atom part = curl:curl_mime_addpart(mime)
+        if part = 0 then
+            curl:curl_mime_free(mime)
+            return 0
+        end if
+
+        integer r1 = curl:curl_mime_name(part, item[1])
+        if r1 != curl:CURLE_OK then
+            curl:curl_mime_free(mime)
+            return 0
+        end if
+
+        integer n = length(item)
+        if n = 2 then
+            r1 = curl:curl_mime_data(part, item[2])
+        elsif n = 3 then
+            if equal(item[3], "file") then
+                r1 = curl:curl_mime_filedata(part, item[2])
+            else
+                r1 = curl:curl_mime_data(part, item[2])
+                if r1 = curl:CURLE_OK then
+                    r1 = curl:curl_mime_filename(part, item[3])
+                end if
+            end if
+        elsif n >= 4 then
+            r1 = curl:curl_mime_data(part, item[2])
+            if r1 = curl:CURLE_OK and length(item[3]) > 0 then
+                r1 = curl:curl_mime_filename(part, item[3])
+            end if
+            if r1 = curl:CURLE_OK and length(item[4]) > 0 then
+                r1 = curl:curl_mime_type(part, item[4])
+            end if
+        end if
+
+        if r1 != curl:CURLE_OK then
+            curl:curl_mime_free(mime)
+            return 0
+        end if
+    end for
+
+    return mime
+end function
+
+-- Promotes a request from ASYNC_STATUS_PENDING into active execution in curl_multi.
+-- Allocates an easy handle, applies options, and starts elapsed/timeout timers.
+-- output_file is opened lazily on the first received chunk
+-- (or created empty upon CURLE_OK with a 0-byte body).
+-- Returns {1, {}} on success or {0, cb_item_or_empty} on pre-start failure.
+function start_pending_request(sequence req)
+    integer req_id = req[REQ_ID]
+    sequence method = req[REQ_METHOD]
+    sequence url = req[REQ_URL]
+    sequence opts = req[REQ_OPTS]
+
+    atom resume_from = kv_get(opts, "resume_from", 0)
+    req[REQ_RESUME_FROM] = resume_from
+    req[REQ_FILE_OPEN_ERR] = 0
+
+    atom eh = curl:curl_easy_init()
+    if eh = 0 then
+        return fail_before_start(req, curl:CURLE_FAILED_INIT, "curl_easy_init failed")
+    end if
+    req[REQ_EASY] = eh
+
+    atom errbuf = allocate(curl:CURL_ERROR_SIZE)
+    poke(errbuf, 0)
+    req[REQ_ERRBUF] = errbuf
+
+    integer rc = curl:curl_easy_setopt(eh, curl:CURLOPT_URL, url)
+    if rc = curl:CURLE_OK then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_ERRORBUFFER, errbuf)
+    end if
+    if rc = curl:CURLE_OK then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_WRITEFUNCTION, CB_WRITE)
+    end if
+    if rc = curl:CURLE_OK then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_WRITEDATA, req_id)
+    end if
+    if rc = curl:CURLE_OK then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_HEADERFUNCTION, CB_HEADER)
+    end if
+    if rc = curl:CURLE_OK then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_HEADERDATA, req_id)
+    end if
+    if rc = curl:CURLE_OK then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_NOPROGRESS, 0)
+    end if
+    if rc = curl:CURLE_OK then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_XFERINFOFUNCTION, CB_XFERINFO)
+    end if
+    if rc = curl:CURLE_OK then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_XFERINFODATA, req_id)
+    end if
+
+    -- Default redirect and compression settings
+    integer follow = kv_get(opts, "follow_redirects", 1)
+    if rc = curl:CURLE_OK then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_FOLLOWLOCATION, follow)
+    end if
+    if rc = curl:CURLE_OK and follow then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_MAXREDIRS, kv_get(opts, "max_redirects", 10))
+    end if
+    if rc = curl:CURLE_OK then
+        sequence enc = kv_get(opts, "accept_encoding", "")
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_ACCEPT_ENCODING, enc)
+    end if
+
+    -- SSL/TLS (uses Windows native CA store by default when ca_info/ca_path are omitted)
+    integer ssl_verify = kv_get(opts, "ssl_verify", 1)
+    sequence ca_info = kv_get(opts, "ca_info", "")
+    sequence ca_path = kv_get(opts, "ca_path", "")
+    if rc = curl:CURLE_OK then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_SSL_VERIFYPEER, ssl_verify)
+    end if
+    if rc = curl:CURLE_OK then
+        integer verify_host = 0
+        if ssl_verify then
+            verify_host = 2
+        end if
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_SSL_VERIFYHOST, verify_host)
+    end if
+    if rc = curl:CURLE_OK and length(ca_info) > 0 then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_CAINFO, ca_info)
+    end if
+    if rc = curl:CURLE_OK and length(ca_path) > 0 then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_CAPATH, ca_path)
+    end if
+    ifdef WINDOWS then
+        if rc = curl:CURLE_OK and ssl_verify and length(ca_info) = 0 and length(ca_path) = 0 then
+            rc = curl:curl_easy_setopt(eh, curl:CURLOPT_SSL_OPTIONS, curl:CURLSSLOPT_NATIVE_CA)
+        end if
+    end ifdef
+
+    -- HTTP method and request body / multipart
+    object form_opt = kv_get(opts, "form", {})
+    object body_opt = kv_get(opts, "body", "")
+    integer has_form = (sequence(form_opt) and length(form_opt) > 0)
+    integer has_body = (sequence(body_opt) and length(body_opt) > 0) or kv_has(opts, "body")
+
+    if rc = curl:CURLE_OK then
+        if equal(method, "HEAD") then
+            rc = curl:curl_easy_setopt(eh, curl:CURLOPT_NOBODY, 1)
+        elsif has_form then
+            atom mime = build_mime_form(eh, form_opt)
+            if mime = 0 then
+                return fail_before_start(req, curl:CURLE_OUT_OF_MEMORY, "Failed to build multipart form-data")
+            end if
+            req[REQ_MIME] = mime
+            rc = curl:curl_easy_setopt(eh, curl:CURLOPT_MIMEPOST, mime)
+            if rc = curl:CURLE_OK and not equal(method, "POST") then
+                rc = curl:curl_easy_setopt(eh, curl:CURLOPT_CUSTOMREQUEST, method)
+            end if
+        elsif equal(method, "POST") then
+            rc = curl:curl_easy_setopt(eh, curl:CURLOPT_POST, 1)
+            if rc = curl:CURLE_OK then
+                if sequence(body_opt) then
+                    req[REQ_UL_TOTAL] = length(body_opt)
+                    rc = curl:curl_easy_setopt(eh, curl:CURLOPT_POSTFIELDSIZE_LARGE, length(body_opt))
+                    if rc = curl:CURLE_OK then
+                        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_POSTFIELDS, body_opt)
+                    end if
+                else
+                    rc = curl:curl_easy_setopt(eh, curl:CURLOPT_POSTFIELDSIZE_LARGE, 0)
+                end if
+            end if
+        elsif not equal(method, "GET") then
+            rc = curl:curl_easy_setopt(eh, curl:CURLOPT_CUSTOMREQUEST, method)
+            if rc = curl:CURLE_OK and has_body and sequence(body_opt) then
+                req[REQ_UL_TOTAL] = length(body_opt)
+                rc = curl:curl_easy_setopt(eh, curl:CURLOPT_POSTFIELDSIZE_LARGE, length(body_opt))
+                if rc = curl:CURLE_OK then
+                    rc = curl:curl_easy_setopt(eh, curl:CURLOPT_POSTFIELDS, body_opt)
+                end if
+            end if
+        end if
+    end if
+
+    -- Custom request headers
+    sequence headers_opt = kv_get(opts, "headers", {})
+    if rc = curl:CURLE_OK and length(headers_opt) > 0 then
+        atom slist = curl:curl_slist_from_sequence(headers_opt)
+        if slist = 0 then
+            return fail_before_start(req, curl:CURLE_OUT_OF_MEMORY, "Failed to allocate curl_slist for headers")
+        end if
+        req[REQ_SLIST] = slist
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_HTTPHEADER, slist)
+    end if
+
+    -- Timeouts, network, proxy, authentication, cookies, and speed limits
+    if rc = curl:CURLE_OK and kv_has(opts, "timeout") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_TIMEOUT_MS, floor(kv_get(opts, "timeout", 0) * 1000))
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "connect_timeout") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_CONNECTTIMEOUT_MS,
+            floor(kv_get(opts, "connect_timeout", 0) * 1000))
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "proxy") then
+        sequence pxy = kv_get(opts, "proxy", "")
+        if length(pxy) > 0 then
+            rc = curl:curl_easy_setopt(eh, curl:CURLOPT_PROXY, pxy)
+        end if
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "proxy_type") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_PROXYTYPE, kv_get(opts, "proxy_type", curl:CURLPROXY_HTTP))
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "proxy_userpwd") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_PROXYUSERPWD, kv_get(opts, "proxy_userpwd", ""))
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "userpwd") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_USERPWD, kv_get(opts, "userpwd", ""))
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "user_agent") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_USERAGENT, kv_get(opts, "user_agent", ""))
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "cookie") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_COOKIE, kv_get(opts, "cookie", ""))
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "cookie_file") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_COOKIEFILE, kv_get(opts, "cookie_file", ""))
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "cookie_jar") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_COOKIEJAR, kv_get(opts, "cookie_jar", ""))
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "max_recv_speed") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_MAX_RECV_SPEED_LARGE, kv_get(opts, "max_recv_speed", 0))
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "max_send_speed") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_MAX_SEND_SPEED_LARGE, kv_get(opts, "max_send_speed", 0))
+    end if
+    if rc = curl:CURLE_OK and resume_from > 0 then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_RESUME_FROM_LARGE, resume_from)
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "http_version") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_HTTP_VERSION, kv_get(opts, "http_version", 0))
+    end if
+    if rc = curl:CURLE_OK and kv_has(opts, "verbose") then
+        rc = curl:curl_easy_setopt(eh, curl:CURLOPT_VERBOSE, kv_get(opts, "verbose", 0))
+    end if
+
+    -- Arbitrary advanced libcurl options ({CURLOPT_*, value})
+    sequence extra_opts = kv_get(opts, "curl_opts", {})
+    for i = 1 to length(extra_opts) do
+        if rc != curl:CURLE_OK then
+            exit
+        end if
+        rc = curl:curl_easy_setopt(eh, extra_opts[i][1], extra_opts[i][2])
+    end for
+
+    if rc != curl:CURLE_OK then
+        return fail_before_start(req, rc, curl:curl_easy_strerror(rc))
+    end if
+
+    -- Release queued options snapshot, register, and attach to multi handle
+    req[REQ_OPTS]       = {}
+    req[REQ_STATUS]     = ASYNC_STATUS_RUNNING
+    req[REQ_START_TIME] = time()
+    req[REQ_ELAPSED]    = 0
+    put_req(req_id, req)
+    map:put(easy_to_id, eh, req_id)
+
+    integer mrc = curl:curl_multi_add_handle(multi_handle, eh)
+    if mrc != curl:CURLM_OK then
+        return fail_before_start(req, curl:CURLE_FAILED_INIT, curl:curl_multi_strerror(mrc))
+    end if
+
+    req[REQ_IN_MULTI] = 1
+    put_req(req_id, req)
+    return {1, {}}
+end function
+
+-- Promotes requests from the FIFO pending_queue into curl_multi
+-- while slots are available (max_concurrent = 0 means unlimited).
+-- Returns {promoted_count, error_callbacks_list}.
+function pump_pending_queue()
+    integer promoted = 0
+    sequence error_cbs = {}
+    if not initialized or multi_handle = 0 then
+        return {0, {}}
+    end if
+
+    while length(pending_queue) > 0 and (max_concurrent <= 0 or count_in_flight() < max_concurrent) do
+        integer req_id = pending_queue[1]
+        pending_queue = pending_queue[2..$]
+
+        object maybe = get_req(req_id)
+        if atom(maybe) then
+            continue
+        end if
+        sequence req = maybe
+        if req[REQ_STATUS] != ASYNC_STATUS_PENDING then
+            continue
+        end if
+
+        sequence res = start_pending_request(req)
+        if res[1] then
+            promoted += 1
+        elsif length(res[2]) > 0 then
+            error_cbs = append(error_cbs, res[2])
+        end if
+    end while
+
+    return {promoted, error_cbs}
+end function
+
+--**
+-- Creates and enqueues an async HTTP request/download without blocking.
+-- If a slot is available (max_concurrent = 0 or in_flight < max_concurrent), starts immediately;
+-- otherwise stays in ASYNC_STATUS_PENDING in the FIFO queue until a slot opens.
+-- Returns an integer req_id (>= 1) to track progress and retrieve the response.
+public function curl_async_request(sequence url, object opts_in = {})
+    if not initialized or multi_handle = 0 then
+        curl_async_init()
+    end if
+
+    sequence opts = normalize_opts_kv(opts_in)
+
+    integer req_id = next_req_id
+    next_req_id += 1
+
+    sequence method = text:upper(kv_get(opts, "method", "GET"))
+    sequence output_file = kv_get(opts, "output_file", "")
+
+    sequence req = new_req_record(req_id, method, url, output_file)
+    req[REQ_ON_PROGRESS] = kv_get(opts, "on_progress", -1)
+    req[REQ_ON_CHUNK]    = kv_get(opts, "on_chunk", -1)
+    req[REQ_ON_COMPLETE] = kv_get(opts, "on_complete", -1)
+    req[REQ_USER_DATA]   = kv_get(opts, "user_data", 0)
+    req[REQ_OPTS]        = opts
+
+    put_req(req_id, req)
+    pending_queue = append(pending_queue, req_id)
+
+    -- When called outside an active callback, try promoting and kicking off DNS/TCP immediately
+    if not in_poll then
+        sequence pumped = pump_pending_queue()
+        fire_callbacks(pumped[2])
+        if pumped[1] > 0 then
+            curl_async_poll()
+        end if
+    end if
+
+    return req_id
+end function
+
+-- =============================================================================
+-- HTTP Verb and Download Shortcuts
+-- =============================================================================
+
+public function curl_async_get(sequence url, sequence output_file = "", object opts_in = {})
+    sequence opts = normalize_opts_kv(opts_in)
+    opts = kv_set(opts, "method", "GET")
+    if length(output_file) > 0 then
+        opts = kv_set(opts, "output_file", output_file)
+    end if
+    return curl_async_request(url, opts)
+end function
+
+public function curl_async_download(sequence url, sequence output_file, object opts_in = {})
+    sequence opts = normalize_opts_kv(opts_in)
+    opts = kv_set(opts, "method", "GET")
+    opts = kv_set(opts, "output_file", output_file)
+    return curl_async_request(url, opts)
+end function
+
+public function curl_async_post(sequence url, sequence body = "", object opts_in = {})
+    sequence opts = normalize_opts_kv(opts_in)
+    opts = kv_set(opts, "method", "POST")
+    if not kv_has(opts, "body") then
+        opts = kv_set(opts, "body", body)
+    end if
+    return curl_async_request(url, opts)
+end function
+
+public function curl_async_put(sequence url, sequence body = "", object opts_in = {})
+    sequence opts = normalize_opts_kv(opts_in)
+    opts = kv_set(opts, "method", "PUT")
+    if not kv_has(opts, "body") then
+        opts = kv_set(opts, "body", body)
+    end if
+    return curl_async_request(url, opts)
+end function
+
+public function curl_async_patch(sequence url, sequence body = "", object opts_in = {})
+    sequence opts = normalize_opts_kv(opts_in)
+    opts = kv_set(opts, "method", "PATCH")
+    if not kv_has(opts, "body") then
+        opts = kv_set(opts, "body", body)
+    end if
+    return curl_async_request(url, opts)
+end function
+
+public function curl_async_delete(sequence url, object opts_in = {})
+    sequence opts = normalize_opts_kv(opts_in)
+    opts = kv_set(opts, "method", "DELETE")
+    return curl_async_request(url, opts)
+end function
+
+public function curl_async_head(sequence url, object opts_in = {})
+    sequence opts = normalize_opts_kv(opts_in)
+    opts = kv_set(opts, "method", "HEAD")
+    return curl_async_request(url, opts)
+end function
+
+-- =============================================================================
+-- Status, Progress, and Metadata Queries (with optional auto-pump)
+-- =============================================================================
+
+procedure maybe_auto_poll(integer auto_poll)
+    if auto_poll and not in_poll and initialized and multi_handle != 0 then
+        curl_async_poll()
+    end if
+end procedure
+
+public function curl_async_status_name(integer status)
+    switch status do
+        case ASYNC_STATUS_PENDING   then return "PENDING"
+        case ASYNC_STATUS_RUNNING   then return "RUNNING"
+        case ASYNC_STATUS_PAUSED    then return "PAUSED"
+        case ASYNC_STATUS_DONE      then return "DONE"
+        case ASYNC_STATUS_ERROR     then return "ERROR"
+        case ASYNC_STATUS_CANCELLED then return "CANCELLED"
+        case else return "UNKNOWN"
+    end switch
+end function
+
+public function curl_async_status(integer req_id, integer auto_poll = 1)
+    maybe_auto_poll(auto_poll)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return 0
+    end if
+    return maybe[REQ_STATUS]
+end function
+
+public function curl_async_is_running(integer req_id, integer auto_poll = 1)
+    integer st = curl_async_status(req_id, auto_poll)
+    return (st = ASYNC_STATUS_PENDING or st = ASYNC_STATUS_RUNNING or st = ASYNC_STATUS_PAUSED)
+end function
+
+public function curl_async_is_done(integer req_id, integer auto_poll = 1)
+    integer st = curl_async_status(req_id, auto_poll)
+    return (st = ASYNC_STATUS_DONE or st = ASYNC_STATUS_ERROR or st = ASYNC_STATUS_CANCELLED)
+end function
+
+public function curl_async_progress(integer req_id, integer auto_poll = 1)
+    maybe_auto_poll(auto_poll)
+    refresh_live_easy_info(req_id)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return {}
+    end if
+    return build_progress_seq(maybe)
+end function
+
+public function curl_async_info(integer req_id, integer auto_poll = 1)
+    maybe_auto_poll(auto_poll)
+    refresh_live_easy_info(req_id)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return {}
+    end if
+    sequence req = maybe
+    sequence prog = build_progress_seq(req)
+    return {
+        req[REQ_ID],
+        req[REQ_STATUS],
+        req[REQ_METHOD],
+        req[REQ_URL],
+        req[REQ_EFFECTIVE_URL],
+        req[REQ_HTTP_CODE],
+        req[REQ_CURL_CODE],
+        req[REQ_ERROR],
+        prog[PROG_DL_NOW],
+        prog[PROG_DL_TOTAL],
+        prog[PROG_DL_PERCENT],
+        prog[PROG_DL_SPEED],
+        prog[PROG_UL_NOW],
+        prog[PROG_UL_TOTAL],
+        prog[PROG_UL_PERCENT],
+        prog[PROG_UL_SPEED],
+        prog[PROG_ELAPSED],
+        req[REQ_CONTENT_TYPE],
+        req[REQ_HEADERS],
+        req[REQ_OUTPUT_FILE],
+        req[REQ_BODY_SIZE]
+    }
+end function
+
+public function curl_async_active_count(integer auto_poll = 1)
+    maybe_auto_poll(auto_poll)
+    return count_active_requests()
+end function
+
+--**
+-- Returns the number of requests waiting in the FIFO queue (ASYNC_STATUS_PENDING).
+public function curl_async_pending_count(integer auto_poll = 1)
+    maybe_auto_poll(auto_poll)
+    return length(pending_queue)
+end function
+
+--**
+-- Returns the number of requests currently running or paused in curl_multi
+-- (occupying max_concurrent execution slots).
+public function curl_async_running_count(integer auto_poll = 1)
+    maybe_auto_poll(auto_poll)
+    return count_in_flight()
+end function
+
+public function curl_async_list(integer active_only = 0)
+    sequence out = {}
+    sequence ids = map:keys(requests)
+    for i = 1 to length(ids) do
+        object maybe = get_req(ids[i])
+        if sequence(maybe) then
+            if not active_only or
+               maybe[REQ_STATUS] = ASYNC_STATUS_PENDING or
+               maybe[REQ_STATUS] = ASYNC_STATUS_RUNNING or
+               maybe[REQ_STATUS] = ASYNC_STATUS_PAUSED then
+                out = append(out, ids[i])
+            end if
+        end if
+    end for
+    return out
+end function
+
+-- =============================================================================
+-- Controlled Waiting (Optional, for scripts synchronizing at the end)
+-- =============================================================================
+
+public function curl_async_wait(integer req_id, integer timeout_ms = -1, integer poll_interval_ms = 20)
+    atom deadline = -1
+    if timeout_ms >= 0 then
+        deadline = time() + (timeout_ms / 1000.0)
+    end if
+
+    while curl_async_is_running(req_id, 1) do
+        if deadline >= 0 and time() >= deadline then
+            exit
+        end if
+        integer wait_ms = poll_interval_ms
+        if wait_ms < 1 then
+            wait_ms = 1
+        end if
+        if deadline >= 0 then
+            integer rem_ms = floor((deadline - time()) * 1000)
+            if rem_ms <= 0 then
+                exit
+            end if
+            if rem_ms < wait_ms then
+                wait_ms = rem_ms
+            end if
+        end if
+        curl_async_wait_step(wait_ms)
+        ifdef not EUC_DLL then
+            task_yield()
+        end ifdef
+    end while
+
+    return curl_async_status(req_id, 0)
+end function
+
+public function curl_async_wait_all(integer timeout_ms = -1, integer poll_interval_ms = 20)
+    atom deadline = -1
+    if timeout_ms >= 0 then
+        deadline = time() + (timeout_ms / 1000.0)
+    end if
+
+    integer active = curl_async_poll()
+    while active > 0 do
+        if deadline >= 0 and time() >= deadline then
+            exit
+        end if
+        integer wait_ms = poll_interval_ms
+        if wait_ms < 1 then
+            wait_ms = 1
+        end if
+        if deadline >= 0 then
+            integer rem_ms = floor((deadline - time()) * 1000)
+            if rem_ms <= 0 then
+                exit
+            end if
+            if rem_ms < wait_ms then
+                wait_ms = rem_ms
+            end if
+        end if
+        active = curl_async_wait_step(wait_ms)
+        ifdef not EUC_DLL then
+            task_yield()
+        end ifdef
+    end while
+
+    return active
+end function
+
+-- =============================================================================
+-- Results, Transfer Control (Pause/Resume/Cancel), and Cleanup
+-- =============================================================================
+
+public function curl_async_response(integer req_id)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return {}
+    end if
+    return {
+        maybe[REQ_STATUS],
+        maybe[REQ_CURL_CODE],
+        maybe[REQ_HTTP_CODE],
+        maybe[REQ_BODY],
+        maybe[REQ_HEADERS],
+        maybe[REQ_ERROR]
+    }
+end function
+
+public function curl_async_body(integer req_id)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return ""
+    end if
+    return maybe[REQ_BODY]
+end function
+
+public function curl_async_headers(integer req_id)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return {}
+    end if
+    return maybe[REQ_HEADERS]
+end function
+
+public function curl_async_error(integer req_id)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return {curl:CURLE_BAD_FUNCTION_ARGUMENT, "Non-existent req_id"}
+    end if
+    return {maybe[REQ_CURL_CODE], maybe[REQ_ERROR]}
+end function
+
+public function curl_async_get_userdata(integer req_id)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return 0
+    end if
+    return maybe[REQ_USER_DATA]
+end function
+
+public function curl_async_pause(integer req_id)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return curl:CURLE_BAD_FUNCTION_ARGUMENT
+    end if
+    sequence req = maybe
+    if req[REQ_EASY] = 0 then
+        return curl:CURLE_BAD_CALLING_ORDER
+    end if
+    integer rc = curl:curl_easy_pause(req[REQ_EASY], curl:CURLPAUSE_ALL)
+    if rc = curl:CURLE_OK then
+        req[REQ_STATUS] = ASYNC_STATUS_PAUSED
+        put_req(req_id, req)
+    end if
+    return rc
+end function
+
+public function curl_async_resume(integer req_id)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return curl:CURLE_BAD_FUNCTION_ARGUMENT
+    end if
+    sequence req = maybe
+    if req[REQ_EASY] = 0 then
+        return curl:CURLE_BAD_CALLING_ORDER
+    end if
+    integer rc = curl:curl_easy_pause(req[REQ_EASY], curl:CURLPAUSE_CONT)
+    if rc = curl:CURLE_OK then
+        if req[REQ_STATUS] = ASYNC_STATUS_PAUSED then
+            req[REQ_STATUS] = ASYNC_STATUS_RUNNING
+            put_req(req_id, req)
+        end if
+        maybe_auto_poll(1)
+    end if
+    return rc
+end function
+
+public function curl_async_cancel(integer req_id)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return 0
+    end if
+    sequence req = maybe
+    if req[REQ_STATUS] = ASYNC_STATUS_DONE or
+       req[REQ_STATUS] = ASYNC_STATUS_ERROR or
+       req[REQ_STATUS] = ASYNC_STATUS_CANCELLED then
+        return 0
+    end if
+
+    -- Case 1: still waiting in the FIFO queue (no easy handle or open file)
+    if req[REQ_STATUS] = ASYNC_STATUS_PENDING then
+        integer qpos = find(req_id, pending_queue)
+        if qpos > 0 then
+            pending_queue = remove(pending_queue, qpos)
+        end if
+        req[REQ_CANCEL_FLAG] = 1
+        req[REQ_ABORT_FLAG]  = 1
+        req[REQ_STATUS]      = ASYNC_STATUS_CANCELLED
+        req[REQ_CURL_CODE]   = curl:CURLE_ABORTED_BY_CALLBACK
+        req[REQ_ERROR]       = "Request cancelled by user"
+        req[REQ_OPTS]        = {}
+        close_req_file(req)
+        req[REQ_FILE_HANDLE] = -1
+        put_req(req_id, req)
+
+        if req[REQ_ON_COMPLETE] >= 0 then
+            if in_poll then
+                deferred_callbacks = append(deferred_callbacks,
+                    {req_id, ASYNC_STATUS_CANCELLED, req[REQ_ON_COMPLETE]})
+            else
+                call_proc(req[REQ_ON_COMPLETE], {req_id, ASYNC_STATUS_CANCELLED})
+            end if
+        end if
+        return 1
+    end if
+
+    -- Case 2: currently running or paused in curl_multi
+    req[REQ_CANCEL_FLAG] = 1
+    req[REQ_ABORT_FLAG] = 1
+    put_req(req_id, req)
+
+    -- When called inside an active callback, only flag abort so that
+    -- finalize_transfer and pump_pending_queue run safely after exiting perform.
+    if in_poll then
+        return 1
+    end if
+
+    if req[REQ_EASY] != 0 then
+        sequence cb = finalize_transfer(req[REQ_EASY], curl:CURLE_ABORTED_BY_CALLBACK)
+        sequence pumped = pump_pending_queue()
+        if length(cb) > 0 then
+            call_proc(cb[3], {cb[1], cb[2]})
+        end if
+        fire_callbacks(pumped[2])
+        if pumped[1] > 0 then
+            curl_async_poll()
+        end if
+    else
+        req[REQ_STATUS] = ASYNC_STATUS_CANCELLED
+        req[REQ_CURL_CODE] = curl:CURLE_ABORTED_BY_CALLBACK
+        req[REQ_ERROR] = "Request cancelled by user"
+        req[REQ_OPTS] = {}
+        close_req_file(req)
+        req[REQ_FILE_HANDLE] = -1
+        put_req(req_id, req)
+        if req[REQ_ON_COMPLETE] >= 0 then
+            call_proc(req[REQ_ON_COMPLETE], {req_id, ASYNC_STATUS_CANCELLED})
+        end if
+    end if
+    return 1
+end function
+
+--**
+-- Frees the request record from memory after reading its results.
+-- If still active, safely cancels it first.
+public procedure curl_async_release(integer req_id)
+    object maybe = get_req(req_id)
+    if atom(maybe) then
+        return
+    end if
+    if maybe[REQ_STATUS] = ASYNC_STATUS_PENDING or
+       maybe[REQ_STATUS] = ASYNC_STATUS_RUNNING or
+       maybe[REQ_STATUS] = ASYNC_STATUS_PAUSED then
+        curl_async_cancel(req_id)
+    end if
+    map:remove(requests, req_id)
+end procedure
+
+-- =============================================================================
+-- Optional Cooperative Multitasking Integration (std/task.e)
+-- =============================================================================
+
+ifdef not EUC_DLL then
+
+procedure async_pump_task()
+    while bg_task_active do
+        curl_async_poll()
+        task_yield()
+    end while
+end procedure
+
+--**
+-- Starts a cooperative background task (std/task.e) that automatically pumps
+-- curl_multi whenever other tasks call task_yield().
+public function curl_async_start_task(atom min_interval = 0.01, atom max_interval = 0.05)
+    if not initialized or multi_handle = 0 then
+        curl_async_init()
+    end if
+    if bg_task_active and bg_task_id != -1 then
+        return bg_task_id
+    end if
+    bg_task_active = 1
+    bg_task_id = task_create(routine_id("async_pump_task"), {})
+    task_schedule(bg_task_id, {min_interval, max_interval})
+    return bg_task_id
+end function
+
+public procedure curl_async_stop_task()
+    if bg_task_active and bg_task_id != -1 then
+        bg_task_active = 0
+        task_suspend(bg_task_id)
+        bg_task_id = -1
+    end if
+end procedure
+
+public function curl_async_task_running()
+    return (bg_task_active and bg_task_id != -1 and task_status(bg_task_id) > 0)
+end function
+
+end ifdef

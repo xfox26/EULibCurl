@@ -1,0 +1,32 @@
+# OpenEuphoria runtime / test artifacts
+ex.err
+unittest.log
+*.il
+*.c
+*.h
+*.o
+*.obj
+*.exe
+!bin/*.dll
+
+# Temporary demo / test files
+eulibcurl_demo_*
+eulibcurl_queue_tmp/
+eulibcurl_qfile_*
+eulibcurl_qcancel*
+eulibcurl_bad_url*
+eulibcurl_to_dl*
+eulibcurl_empty_dl*
+t_up_*
+t_dl_*
+t_res_*
+t_eucurl_*
+*.tmp
+
+# Python / OS / IDE
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

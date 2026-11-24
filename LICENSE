@@ -19,3 +19,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Third-Party Components:
+This repository redistributes prebuilt official Windows binaries of libcurl
+(bin/libcurl-x32.dll and bin/libcurl-x64.dll). See bin/THIRD_PARTY_NOTICES.txt
+for full license texts, copyright notices, and SHA-256 checksums.

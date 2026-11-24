@@ -1,0 +1,1765 @@
+-- =============================================================================
+-- euLibCurl.ew - Complete libcurl 8.15.0 wrapper for OpenEuphoria 4.1+
+--
+-- Covers 100% of all 96 exported functions in libcurl-x32.dll / libcurl-x64.dll
+-- (v8.15.0_5), with proper Windows cdecl callbacks, per-handle memory tracking,
+-- 64-bit option support (curl_off_t), blobs, headers, URL API,
+-- MIME, Share, Multi, and WebSockets.
+-- =============================================================================
+
+namespace curl
+
+public include eulibcurl/curl_constants.e
+
+include std/convert.e
+include std/dll.e
+include std/error.e
+include std/machine.e
+include std/map.e
+include std/types.e
+
+-- =============================================================================
+-- Architecture configuration, DLL loading, and cdecl linking
+-- =============================================================================
+
+constant PTR_SIZE = sizeof(C_POINTER)
+constant SIZEOF_CURL_BLOB = PTR_SIZE * 3
+
+ifdef BITS64 then
+    constant LIBCURL_DLL_NAME = "libcurl-x64.dll"
+    constant LIBCURL_DLL_CANDIDATES = {"bin/libcurl-x64.dll", "libcurl-x64.dll"}
+elsedef
+    ifdef WINDOWS then
+        constant LIBCURL_DLL_NAME = "libcurl-x32.dll"
+        constant LIBCURL_DLL_CANDIDATES = {"bin/libcurl-x32.dll", "libcurl-x32.dll"}
+    elsedef
+        constant LIBCURL_DLL_NAME = "libcurl.so.4"
+        constant LIBCURL_DLL_CANDIDATES = {"libcurl.so.4", "libcurl.so"}
+    end ifdef
+end ifdef
+
+constant LibCurlLib = open_dll(LIBCURL_DLL_CANDIDATES)
+if LibCurlLib = 0 then
+    error:crash("Unable to load shared library %s", {LIBCURL_DLL_NAME})
+end if
+
+sequence linked_symbol_names = {}
+
+function cdecl_link_func(sequence name, sequence args, atom ret_type)
+    sequence sym = name
+    ifdef WINDOWS then
+        sym = "+" & name
+    end ifdef
+    integer rid = define_c_func(LibCurlLib, sym, args, ret_type)
+    if rid = -1 then
+        error:crash("Failed to link C function '%s' in %s", {name, LIBCURL_DLL_NAME})
+    end if
+    if not find(name, linked_symbol_names) then
+        linked_symbol_names = append(linked_symbol_names, name)
+    end if
+    return rid
+end function
+
+function cdecl_link_proc(sequence name, sequence args)
+    sequence sym = name
+    ifdef WINDOWS then
+        sym = "+" & name
+    end ifdef
+    integer rid = define_c_proc(LibCurlLib, sym, args)
+    if rid = -1 then
+        error:crash("Failed to link C procedure '%s' in %s", {name, LIBCURL_DLL_NAME})
+    end if
+    if not find(name, linked_symbol_names) then
+        linked_symbol_names = append(linked_symbol_names, name)
+    end if
+    return rid
+end function
+
+--**
+-- Returns the native handle (atom) returned by open_dll() for the loaded libcurl library.
+public function curl_dll_handle()
+    return LibCurlLib
+end function
+
+--**
+-- Returns the number of DLL functions/procedures linked by this wrapper.
+public function curl_linked_count()
+    return length(linked_symbol_names)
+end function
+
+--**
+-- Returns a sequence containing the exact names of all linked C symbols.
+public function curl_linked_names()
+    return linked_symbol_names
+end function
+
+--**
+-- Creates a C callback pointer compatible with libcurl's cdecl calling convention.
+-- Uses {'+', rid} on Windows and rid directly on Unix platforms.
+public function curl_callback(integer rid)
+    if rid < 0 then
+        error:crash("Invalid routine_id (%d) passed to curl_callback()", {rid})
+    end if
+    ifdef WINDOWS then
+        return call_back({'+', rid})
+    elsedef
+        return call_back(rid)
+    end ifdef
+end function
+
+function read_opt_cstr(atom ptr)
+    if ptr = 0 then
+        return ""
+    end if
+    return peek_string(ptr)
+end function
+
+function alloc_bytes_cstr(sequence data)
+    integer n = length(data)
+    atom ptr = allocate(n + 1)
+    if n > 0 then
+        poke(ptr, data)
+    end if
+    poke(ptr + n, 0)
+    return ptr
+end function
+
+function read_cstr_array(atom arr_ptr)
+    sequence out = {}
+    if arr_ptr = 0 then
+        return out
+    end if
+    atom cur = arr_ptr
+    atom item_ptr = peek_pointer(cur)
+    while item_ptr != 0 do
+        out = append(out, peek_string(item_ptr))
+        cur += PTR_SIZE
+        item_ptr = peek_pointer(cur)
+    end while
+    return out
+end function
+
+-- =============================================================================
+-- Structured enums for composite return values
+-- =============================================================================
+
+-- Fields returned by curl_version_info()
+public enum
+    VI_AGE = 1,
+    VI_VERSION,
+    VI_VERSION_NUM,
+    VI_HOST,
+    VI_FEATURES,
+    VI_SSL_VERSION,
+    VI_SSL_VERSION_NUM,
+    VI_LIBZ_VERSION,
+    VI_PROTOCOLS,
+    VI_ARES,
+    VI_ARES_NUM,
+    VI_LIBIDN,
+    VI_ICONV_VER_NUM,
+    VI_LIBSSH_VERSION,
+    VI_BROTLI_VER_NUM,
+    VI_BROTLI_VERSION,
+    VI_NGHTTP2_VER_NUM,
+    VI_NGHTTP2_VERSION,
+    VI_QUIC_VERSION,
+    VI_CAINFO,
+    VI_CAPATH,
+    VI_ZSTD_VER_NUM,
+    VI_ZSTD_VERSION,
+    VI_HYPER_VERSION,
+    VI_GSASL_VERSION,
+    VI_FEATURE_NAMES,
+    VI_RTMP_VERSION
+
+-- Fields returned by curl_easy_option_*()
+public enum
+    EOPT_NAME = 1,
+    EOPT_ID,
+    EOPT_TYPE,
+    EOPT_FLAGS,
+    EOPT_RAW_PTR
+
+-- Fields returned by curl_easy_header() / curl_easy_nextheader()
+public enum
+    HDR_NAME = 1,
+    HDR_VALUE,
+    HDR_AMOUNT,
+    HDR_INDEX,
+    HDR_ORIGIN,
+    HDR_ANCHOR,
+    HDR_RAW_PTR
+
+-- Fields returned by curl_multi_info_read()
+public enum
+    MMSG_MSG = 1,
+    MMSG_EASY_HANDLE,
+    MMSG_RESULT,
+    MMSG_QUEUED
+
+-- Metadata fields returned by curl_ws_recv() / curl_ws_meta()
+public enum
+    WS_AGE = 1,
+    WS_FLAGS,
+    WS_OFFSET,
+    WS_BYTESLEFT,
+    WS_LEN
+
+-- =============================================================================
+-- Per-Easy-Handle allocation management
+-- =============================================================================
+
+map handle_allocs = map:new()
+
+procedure free_handle_opt_alloc(atom curl, integer opt)
+    object sub = map:get(handle_allocs, curl, 0)
+    if map:map(sub) and map:has(sub, opt) then
+        atom old_ptr = map:get(sub, opt, 0)
+        if old_ptr != 0 then
+            free(old_ptr)
+        end if
+        map:remove(sub, opt)
+    end if
+end procedure
+
+procedure set_handle_opt_alloc(atom curl, integer opt, atom ptr)
+    object sub = map:get(handle_allocs, curl, 0)
+    if not map:map(sub) then
+        sub = map:new()
+        map:put(handle_allocs, curl, sub)
+    end if
+    if map:has(sub, opt) then
+        atom old_ptr = map:get(sub, opt, 0)
+        if old_ptr != 0 then
+            free(old_ptr)
+        end if
+    end if
+    map:put(sub, opt, ptr)
+end procedure
+
+procedure free_all_handle_allocs(atom curl)
+    object sub = map:get(handle_allocs, curl, 0)
+    if map:map(sub) then
+        sequence ks = map:keys(sub)
+        for i = 1 to length(ks) do
+            atom ptr = map:get(sub, ks[i], 0)
+            if ptr != 0 then
+                free(ptr)
+            end if
+        end for
+        map:remove(handle_allocs, curl)
+    end if
+end procedure
+
+-- =============================================================================
+-- 1. Global, Version, and Utilities (12 functions)
+-- =============================================================================
+
+constant
+    fn_global_init     = cdecl_link_func("curl_global_init", {C_LONG}, C_INT),
+    fn_global_init_mem = cdecl_link_func("curl_global_init_mem",
+        {C_LONG, C_POINTER, C_POINTER, C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    pr_global_cleanup  = cdecl_link_proc("curl_global_cleanup", {}),
+    fn_global_sslset   = cdecl_link_func("curl_global_sslset", {C_INT, C_POINTER, C_POINTER}, C_INT),
+    fn_global_trace    = cdecl_link_func("curl_global_trace", {C_POINTER}, C_INT),
+    fn_version         = cdecl_link_func("curl_version", {}, C_POINTER),
+    fn_version_info    = cdecl_link_func("curl_version_info", {C_INT}, C_POINTER),
+    pr_free            = cdecl_link_proc("curl_free", {C_POINTER}),
+    fn_getdate         = cdecl_link_func("curl_getdate", {C_POINTER, C_POINTER}, C_LONGLONG),
+    fn_getenv          = cdecl_link_func("curl_getenv", {C_POINTER}, C_POINTER),
+    fn_strequal        = cdecl_link_func("curl_strequal", {C_POINTER, C_POINTER}, C_INT),
+    fn_strnequal       = cdecl_link_func("curl_strnequal", {C_POINTER, C_POINTER, C_POINTER}, C_INT)
+
+public function curl_global_init(atom flags = CURL_GLOBAL_DEFAULT)
+    return c_func(fn_global_init, {flags})
+end function
+
+public function curl_global_init_mem(atom flags, atom malloc_cb, atom free_cb,
+        atom realloc_cb, atom strdup_cb, atom calloc_cb)
+    return c_func(fn_global_init_mem, {flags, malloc_cb, free_cb, realloc_cb, strdup_cb, calloc_cb})
+end function
+
+public procedure curl_global_cleanup()
+    c_proc(pr_global_cleanup, {})
+end procedure
+
+--**
+-- Selects the SSL backend before curl_global_init() or queries available backends.
+-- Returns {CURLsslset_code, backend_list} where each item is {id, name}.
+public function curl_global_sslset(integer backend_id = -1, sequence backend_name = "")
+    atom name_ptr = 0
+    if length(backend_name) > 0 then
+        name_ptr = allocate_string(backend_name)
+    end if
+    atom avail_pp = allocate(PTR_SIZE)
+    poke_pointer(avail_pp, 0)
+
+    integer rc = c_func(fn_global_sslset, {backend_id, name_ptr, avail_pp})
+    if name_ptr != 0 then
+        free(name_ptr)
+    end if
+
+    sequence backends = {}
+    atom arr = peek_pointer(avail_pp)
+    free(avail_pp)
+
+    if arr != 0 then
+        atom item_entry = peek_pointer(arr)
+        while item_entry != 0 do
+            integer bid = peek4s(item_entry)
+            atom bname_ptr = peek_pointer(item_entry + PTR_SIZE)
+            backends = append(backends, {bid, read_opt_cstr(bname_ptr)})
+            arr += PTR_SIZE
+            item_entry = peek_pointer(arr)
+        end while
+    end if
+
+    return {rc, backends}
+end function
+
+public function curl_global_trace(sequence config)
+    atom cfg_ptr = allocate_string(config)
+    integer rc = c_func(fn_global_trace, {cfg_ptr})
+    free(cfg_ptr)
+    return rc
+end function
+
+public function curl_version()
+    return read_opt_cstr(c_func(fn_version, {}))
+end function
+
+public function curl_version_info_raw(integer age = CURLVERSION_NOW)
+    return c_func(fn_version_info, {age})
+end function
+
+--**
+-- Queries detailed libcurl build information as a structured sequence (indexed by VI_*).
+public function curl_version_info(integer age = CURLVERSION_NOW)
+    atom vi = c_func(fn_version_info, {age})
+    if vi = 0 then
+        return {}
+    end if
+
+    sequence info = repeat("", VI_RTMP_VERSION)
+    info[VI_ARES_NUM]        = 0
+    info[VI_ICONV_VER_NUM]   = 0
+    info[VI_BROTLI_VER_NUM]  = 0
+    info[VI_NGHTTP2_VER_NUM] = 0
+    info[VI_ZSTD_VER_NUM]    = 0
+    info[VI_PROTOCOLS]       = {}
+    info[VI_FEATURE_NAMES]   = {}
+
+    ifdef BITS64 then
+        integer st_age = peek4s(vi + 0)
+        info[VI_AGE]             = st_age
+        info[VI_VERSION]         = read_opt_cstr(peek_pointer(vi + 8))
+        info[VI_VERSION_NUM]     = peek4u(vi + 16)
+        info[VI_HOST]            = read_opt_cstr(peek_pointer(vi + 24))
+        info[VI_FEATURES]        = peek4u(vi + 32)
+        info[VI_SSL_VERSION]     = read_opt_cstr(peek_pointer(vi + 40))
+        info[VI_SSL_VERSION_NUM] = peek_longs(vi + 48)
+        info[VI_LIBZ_VERSION]    = read_opt_cstr(peek_pointer(vi + 56))
+        info[VI_PROTOCOLS]       = read_cstr_array(peek_pointer(vi + 64))
+        if st_age >= CURLVERSION_SECOND then
+            info[VI_ARES]        = read_opt_cstr(peek_pointer(vi + 72))
+            info[VI_ARES_NUM]    = peek4s(vi + 80)
+        end if
+        if st_age >= CURLVERSION_THIRD then
+            info[VI_LIBIDN]      = read_opt_cstr(peek_pointer(vi + 88))
+        end if
+        if st_age >= CURLVERSION_FOURTH then
+            info[VI_ICONV_VER_NUM]   = peek4s(vi + 96)
+            info[VI_LIBSSH_VERSION]  = read_opt_cstr(peek_pointer(vi + 104))
+        end if
+        if st_age >= CURLVERSION_FIFTH then
+            info[VI_BROTLI_VER_NUM]  = peek4u(vi + 112)
+            info[VI_BROTLI_VERSION]  = read_opt_cstr(peek_pointer(vi + 120))
+        end if
+        if st_age >= CURLVERSION_SIXTH then
+            info[VI_NGHTTP2_VER_NUM] = peek4u(vi + 128)
+            info[VI_NGHTTP2_VERSION] = read_opt_cstr(peek_pointer(vi + 136))
+            info[VI_QUIC_VERSION]    = read_opt_cstr(peek_pointer(vi + 144))
+        end if
+        if st_age >= CURLVERSION_SEVENTH then
+            info[VI_CAINFO]          = read_opt_cstr(peek_pointer(vi + 152))
+            info[VI_CAPATH]          = read_opt_cstr(peek_pointer(vi + 160))
+        end if
+        if st_age >= CURLVERSION_EIGHTH then
+            info[VI_ZSTD_VER_NUM]    = peek4u(vi + 168)
+            info[VI_ZSTD_VERSION]    = read_opt_cstr(peek_pointer(vi + 176))
+        end if
+        if st_age >= CURLVERSION_NINTH then
+            info[VI_HYPER_VERSION]   = read_opt_cstr(peek_pointer(vi + 184))
+        end if
+        if st_age >= CURLVERSION_TENTH then
+            info[VI_GSASL_VERSION]   = read_opt_cstr(peek_pointer(vi + 192))
+        end if
+        if st_age >= CURLVERSION_ELEVENTH then
+            info[VI_FEATURE_NAMES]   = read_cstr_array(peek_pointer(vi + 200))
+        end if
+        if st_age >= CURLVERSION_TWELFTH then
+            info[VI_RTMP_VERSION]    = read_opt_cstr(peek_pointer(vi + 208))
+        end if
+    elsedef
+        integer st_age = peek4s(vi + 0)
+        info[VI_AGE]             = st_age
+        info[VI_VERSION]         = read_opt_cstr(peek_pointer(vi + 4))
+        info[VI_VERSION_NUM]     = peek4u(vi + 8)
+        info[VI_HOST]            = read_opt_cstr(peek_pointer(vi + 12))
+        info[VI_FEATURES]        = peek4u(vi + 16)
+        info[VI_SSL_VERSION]     = read_opt_cstr(peek_pointer(vi + 20))
+        info[VI_SSL_VERSION_NUM] = peek_longs(vi + 24)
+        info[VI_LIBZ_VERSION]    = read_opt_cstr(peek_pointer(vi + 28))
+        info[VI_PROTOCOLS]       = read_cstr_array(peek_pointer(vi + 32))
+        if st_age >= CURLVERSION_SECOND then
+            info[VI_ARES]        = read_opt_cstr(peek_pointer(vi + 36))
+            info[VI_ARES_NUM]    = peek4s(vi + 40)
+        end if
+        if st_age >= CURLVERSION_THIRD then
+            info[VI_LIBIDN]      = read_opt_cstr(peek_pointer(vi + 44))
+        end if
+        if st_age >= CURLVERSION_FOURTH then
+            info[VI_ICONV_VER_NUM]   = peek4s(vi + 48)
+            info[VI_LIBSSH_VERSION]  = read_opt_cstr(peek_pointer(vi + 52))
+        end if
+        if st_age >= CURLVERSION_FIFTH then
+            info[VI_BROTLI_VER_NUM]  = peek4u(vi + 56)
+            info[VI_BROTLI_VERSION]  = read_opt_cstr(peek_pointer(vi + 60))
+        end if
+        if st_age >= CURLVERSION_SIXTH then
+            info[VI_NGHTTP2_VER_NUM] = peek4u(vi + 64)
+            info[VI_NGHTTP2_VERSION] = read_opt_cstr(peek_pointer(vi + 68))
+            info[VI_QUIC_VERSION]    = read_opt_cstr(peek_pointer(vi + 72))
+        end if
+        if st_age >= CURLVERSION_SEVENTH then
+            info[VI_CAINFO]          = read_opt_cstr(peek_pointer(vi + 76))
+            info[VI_CAPATH]          = read_opt_cstr(peek_pointer(vi + 80))
+        end if
+        if st_age >= CURLVERSION_EIGHTH then
+            info[VI_ZSTD_VER_NUM]    = peek4u(vi + 84)
+            info[VI_ZSTD_VERSION]    = read_opt_cstr(peek_pointer(vi + 88))
+        end if
+        if st_age >= CURLVERSION_NINTH then
+            info[VI_HYPER_VERSION]   = read_opt_cstr(peek_pointer(vi + 92))
+        end if
+        if st_age >= CURLVERSION_TENTH then
+            info[VI_GSASL_VERSION]   = read_opt_cstr(peek_pointer(vi + 96))
+        end if
+        if st_age >= CURLVERSION_ELEVENTH then
+            info[VI_FEATURE_NAMES]   = read_cstr_array(peek_pointer(vi + 100))
+        end if
+        if st_age >= CURLVERSION_TWELFTH then
+            info[VI_RTMP_VERSION]    = read_opt_cstr(peek_pointer(vi + 104))
+        end if
+    end ifdef
+
+    return info
+end function
+
+public procedure curl_free(atom ptr)
+    if ptr != 0 then
+        c_proc(pr_free, {ptr})
+    end if
+end procedure
+
+public function curl_getdate(sequence datestr, atom unused_now = 0)
+    atom p = allocate_string(datestr)
+    atom ts = c_func(fn_getdate, {p, unused_now})
+    free(p)
+    return ts
+end function
+
+public function curl_getenv(sequence name)
+    atom np = allocate_string(name)
+    atom rp = c_func(fn_getenv, {np})
+    free(np)
+    if rp = 0 then
+        return ""
+    end if
+    sequence res = peek_string(rp)
+    curl_free(rp)
+    return res
+end function
+
+public function curl_strequal(sequence s1, sequence s2)
+    atom p1 = allocate_string(s1)
+    atom p2 = allocate_string(s2)
+    integer res = c_func(fn_strequal, {p1, p2})
+    free(p1)
+    free(p2)
+    return res
+end function
+
+public function curl_strnequal(sequence s1, sequence s2, atom max_len)
+    atom p1 = allocate_string(s1)
+    atom p2 = allocate_string(s2)
+    integer res = c_func(fn_strnequal, {p1, p2, max_len})
+    free(p1)
+    free(p2)
+    return res
+end function
+
+-- =============================================================================
+-- 2. Slist API (2 C functions + helpers)
+-- =============================================================================
+
+constant
+    fn_slist_append   = cdecl_link_func("curl_slist_append", {C_POINTER, C_POINTER}, C_POINTER),
+    pr_slist_free_all = cdecl_link_proc("curl_slist_free_all", {C_POINTER})
+
+public function curl_slist_append(atom slist, sequence item)
+    atom sp = allocate_string(item)
+    atom res = c_func(fn_slist_append, {slist, sp})
+    free(sp)
+    return res
+end function
+
+public procedure curl_slist_free_all(atom slist)
+    if slist != 0 then
+        c_proc(pr_slist_free_all, {slist})
+    end if
+end procedure
+
+public function curl_slist_from_sequence(sequence items)
+    atom slist = 0
+    for i = 1 to length(items) do
+        atom next_list = curl_slist_append(slist, items[i])
+        if next_list = 0 then
+            curl_slist_free_all(slist)
+            return 0
+        end if
+        slist = next_list
+    end for
+    return slist
+end function
+
+public function curl_slist_to_sequence(atom slist)
+    sequence res = {}
+    atom cur = slist
+    while cur != 0 do
+        res = append(res, read_opt_cstr(peek_pointer(cur)))
+        cur = peek_pointer(cur + PTR_SIZE)
+    end while
+    return res
+end function
+
+-- =============================================================================
+-- 3. Easy API Core (16 functions)
+-- =============================================================================
+
+constant
+    fn_easy_init        = cdecl_link_func("curl_easy_init", {}, C_POINTER),
+    pr_easy_cleanup     = cdecl_link_proc("curl_easy_cleanup", {C_POINTER}),
+    fn_easy_setopt_long = cdecl_link_func("curl_easy_setopt", {C_POINTER, C_INT, C_LONG}, C_INT),
+    fn_easy_setopt_ptr  = cdecl_link_func("curl_easy_setopt", {C_POINTER, C_INT, C_POINTER}, C_INT),
+    fn_easy_setopt_offt = cdecl_link_func("curl_easy_setopt", {C_POINTER, C_INT, C_LONGLONG}, C_INT),
+    fn_easy_perform     = cdecl_link_func("curl_easy_perform", {C_POINTER}, C_INT),
+    fn_easy_getinfo     = cdecl_link_func("curl_easy_getinfo", {C_POINTER, C_INT, C_POINTER}, C_INT),
+    pr_easy_reset       = cdecl_link_proc("curl_easy_reset", {C_POINTER}),
+    fn_easy_duphandle   = cdecl_link_func("curl_easy_duphandle", {C_POINTER}, C_POINTER),
+    fn_easy_pause       = cdecl_link_func("curl_easy_pause", {C_POINTER, C_INT}, C_INT),
+    fn_easy_escape      = cdecl_link_func("curl_easy_escape", {C_POINTER, C_POINTER, C_INT}, C_POINTER),
+    fn_easy_unescape    = cdecl_link_func("curl_easy_unescape", {C_POINTER, C_POINTER, C_INT, C_POINTER}, C_POINTER),
+    fn_easy_recv        = cdecl_link_func("curl_easy_recv", {C_POINTER, C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_easy_send        = cdecl_link_func("curl_easy_send", {C_POINTER, C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_easy_strerror    = cdecl_link_func("curl_easy_strerror", {C_INT}, C_POINTER),
+    fn_easy_upkeep      = cdecl_link_func("curl_easy_upkeep", {C_POINTER}, C_INT),
+    fn_easy_ssls_export = cdecl_link_func("curl_easy_ssls_export", {C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_easy_ssls_import = cdecl_link_func("curl_easy_ssls_import",
+        {C_POINTER, C_POINTER, C_POINTER, C_POINTER, C_POINTER, C_POINTER}, C_INT)
+
+public function curl_easy_init()
+    return c_func(fn_easy_init, {})
+end function
+
+public procedure curl_easy_cleanup(atom curl)
+    if curl != 0 then
+        c_proc(pr_easy_cleanup, {curl})
+        free_all_handle_allocs(curl)
+    end if
+end procedure
+
+public procedure curl_easy_reset(atom curl)
+    if curl != 0 then
+        c_proc(pr_easy_reset, {curl})
+        free_all_handle_allocs(curl)
+    end if
+end procedure
+
+public function curl_easy_duphandle(atom curl)
+    return c_func(fn_easy_duphandle, {curl})
+end function
+
+--**
+-- Sets options on an Easy Handle, dispatching according to the option type:
+-- LONG (<10000), OBJECT/STRING/CB/SLIST (10000..29999), 64-bit OFF_T (30000..39999),
+-- and BLOB (>=40000, automatically packing a sequence into struct curl_blob).
+public function curl_easy_setopt(atom curl, integer opt, object param)
+    if opt >= 30000 and opt < 40000 then
+        if sequence(param) then
+            error:crash("OFF_T option (%d) expects a number (atom), not a sequence", {opt})
+        end if
+        return c_func(fn_easy_setopt_offt, {curl, opt, param})
+    end if
+
+    if opt >= 40000 and opt < 50000 then
+        if sequence(param) then
+            integer blen = length(param)
+            atom data_ptr = 0
+            if blen > 0 then
+                data_ptr = allocate(blen)
+                poke(data_ptr, param)
+            end if
+            atom blob_ptr = allocate(SIZEOF_CURL_BLOB)
+            poke_pointer(blob_ptr, data_ptr)
+            poke_pointer(blob_ptr + PTR_SIZE, blen)
+            poke4(blob_ptr + (PTR_SIZE * 2), CURL_BLOB_COPY)
+
+            integer rc = c_func(fn_easy_setopt_ptr, {curl, opt, blob_ptr})
+            free(blob_ptr)
+            if data_ptr != 0 then
+                free(data_ptr)
+            end if
+            return rc
+        end if
+        return c_func(fn_easy_setopt_ptr, {curl, opt, param})
+    end if
+
+    if opt < 10000 then
+        if sequence(param) then
+            error:crash("LONG option (%d) expects a number (atom/integer), not a sequence", {opt})
+        end if
+        return c_func(fn_easy_setopt_long, {curl, opt, param})
+    end if
+
+    if sequence(param) then
+        if opt = CURLOPT_POSTFIELDS then
+            atom p = alloc_bytes_cstr(param)
+            set_handle_opt_alloc(curl, opt, p)
+            return c_func(fn_easy_setopt_ptr, {curl, opt, p})
+        end if
+        atom tmp_ptr = alloc_bytes_cstr(param)
+        integer rc = c_func(fn_easy_setopt_ptr, {curl, opt, tmp_ptr})
+        free(tmp_ptr)
+        return rc
+    end if
+
+    if opt = CURLOPT_POSTFIELDS or opt = CURLOPT_ERRORBUFFER then
+        free_handle_opt_alloc(curl, opt)
+    end if
+    return c_func(fn_easy_setopt_ptr, {curl, opt, param})
+end function
+
+public function curl_easy_perform(atom curl)
+    return c_func(fn_easy_perform, {curl})
+end function
+
+--**
+-- Raw version of curl_easy_getinfo: writes the result into a caller-provided C buffer.
+public function curl_easy_getinfo_raw(atom curl, integer info, atom out_ptr)
+    return c_func(fn_easy_getinfo, {curl, info, out_ptr})
+end function
+
+--**
+-- Queries transfer information, automatically decoding according to the CURLINFO_* type.
+-- Returns {CURLcode, value}. For CURLINFO_SLIST (e.g., COOKIELIST, SSL_ENGINES) converts to
+-- a sequence of strings and frees the C list automatically.
+public function curl_easy_getinfo(atom curl, integer info)
+    atom buf = allocate(8)
+    poke8(buf, 0)
+
+    integer rc = c_func(fn_easy_getinfo, {curl, info, buf})
+    if rc != CURLE_OK then
+        free(buf)
+        return {rc, 0}
+    end if
+
+    integer typ = and_bits(info, CURLINFO_TYPEMASK)
+    object val = 0
+
+    switch typ do
+        case CURLINFO_STRING then
+            val = read_opt_cstr(peek_pointer(buf))
+        case CURLINFO_LONG then
+            val = peek_longs(buf)
+        case CURLINFO_DOUBLE then
+            val = float64_to_atom(peek({buf, 8}))
+        case CURLINFO_SLIST then
+            atom p = peek_pointer(buf)
+            if info = CURLINFO_SSL_ENGINES or info = CURLINFO_COOKIELIST then
+                val = curl_slist_to_sequence(p)
+                curl_slist_free_all(p)
+            else
+                val = p
+            end if
+        case CURLINFO_SOCKET then
+            val = peek_pointer(buf)
+        case CURLINFO_OFF_T then
+            val = peek8s(buf)
+        case else
+            val = peek_pointer(buf)
+    end switch
+
+    free(buf)
+    return {rc, val}
+end function
+
+public function curl_easy_pause(atom curl, integer bitmask)
+    return c_func(fn_easy_pause, {curl, bitmask})
+end function
+
+public function curl_easy_escape(atom curl, sequence text)
+    integer n = length(text)
+    if n = 0 then
+        return ""
+    end if
+    atom in_ptr = allocate(n)
+    poke(in_ptr, text)
+    atom ret_ptr = c_func(fn_easy_escape, {curl, in_ptr, n})
+    free(in_ptr)
+    if ret_ptr = 0 then
+        return ""
+    end if
+    sequence res = peek_string(ret_ptr)
+    curl_free(ret_ptr)
+    return res
+end function
+
+public function curl_easy_unescape(atom curl, sequence text)
+    integer n = length(text)
+    if n = 0 then
+        return ""
+    end if
+    atom in_ptr = allocate(n)
+    poke(in_ptr, text)
+    atom outlen_ptr = allocate(4)
+    poke4(outlen_ptr, 0)
+
+    atom ret_ptr = c_func(fn_easy_unescape, {curl, in_ptr, n, outlen_ptr})
+    free(in_ptr)
+
+    integer outlen = peek4s(outlen_ptr)
+    free(outlen_ptr)
+
+    if ret_ptr = 0 then
+        return ""
+    end if
+    sequence res = ""
+    if outlen > 0 then
+        res = peek({ret_ptr, outlen})
+    end if
+    curl_free(ret_ptr)
+    return res
+end function
+
+--**
+-- Receives raw bytes from a socket connected with CURLOPT_CONNECT_ONLY.
+-- Returns {CURLcode, received_bytes_sequence}.
+public function curl_easy_recv(atom curl, integer max_len = 16384)
+    if max_len <= 0 then
+        return {CURLE_BAD_FUNCTION_ARGUMENT, ""}
+    end if
+    atom buf = allocate(max_len)
+    atom n_ptr = allocate(PTR_SIZE)
+    poke_pointer(n_ptr, 0)
+
+    integer rc = c_func(fn_easy_recv, {curl, buf, max_len, n_ptr})
+    atom nread = peek_pointer(n_ptr)
+    free(n_ptr)
+
+    sequence data = ""
+    if rc = CURLE_OK and nread > 0 then
+        data = peek({buf, nread})
+    end if
+    free(buf)
+    return {rc, data}
+end function
+
+--**
+-- Sends raw bytes over a socket connected with CURLOPT_CONNECT_ONLY.
+-- Returns {CURLcode, bytes_sent}.
+public function curl_easy_send(atom curl, sequence data)
+    integer n = length(data)
+    atom buf = 0
+    if n > 0 then
+        buf = allocate(n)
+        poke(buf, data)
+    else
+        buf = allocate(1)
+        poke(buf, 0)
+    end if
+    atom n_ptr = allocate(PTR_SIZE)
+    poke_pointer(n_ptr, 0)
+
+    integer rc = c_func(fn_easy_send, {curl, buf, n, n_ptr})
+    atom nsent = peek_pointer(n_ptr)
+    free(n_ptr)
+    free(buf)
+    return {rc, nsent}
+end function
+
+public function curl_easy_strerror(integer err_code)
+    return read_opt_cstr(c_func(fn_easy_strerror, {err_code}))
+end function
+
+public function curl_easy_upkeep(atom curl)
+    return c_func(fn_easy_upkeep, {curl})
+end function
+
+public function curl_easy_ssls_export(atom curl, atom export_cb, atom userptr = 0)
+    return c_func(fn_easy_ssls_export, {curl, export_cb, userptr})
+end function
+
+public function curl_easy_ssls_import(atom curl, sequence session_key,
+        sequence shmac, sequence sdata)
+    atom key_ptr = allocate_string(session_key)
+    integer hmac_len = length(shmac)
+    integer data_len = length(sdata)
+    atom hmac_ptr = 0
+    atom data_ptr = 0
+    if hmac_len > 0 then
+        hmac_ptr = allocate(hmac_len)
+        poke(hmac_ptr, shmac)
+    end if
+    if data_len > 0 then
+        data_ptr = allocate(data_len)
+        poke(data_ptr, sdata)
+    end if
+    integer rc = c_func(fn_easy_ssls_import, {curl, key_ptr, hmac_ptr, hmac_len, data_ptr, data_len})
+    free(key_ptr)
+    if hmac_ptr != 0 then
+        free(hmac_ptr)
+    end if
+    if data_ptr != 0 then
+        free(data_ptr)
+    end if
+    return rc
+end function
+
+-- =============================================================================
+-- 4. Easy Options Introspection & Header API (5 functions)
+-- =============================================================================
+
+constant
+    fn_easy_option_by_id   = cdecl_link_func("curl_easy_option_by_id", {C_INT}, C_POINTER),
+    fn_easy_option_by_name = cdecl_link_func("curl_easy_option_by_name", {C_POINTER}, C_POINTER),
+    fn_easy_option_next    = cdecl_link_func("curl_easy_option_next", {C_POINTER}, C_POINTER),
+    fn_easy_header         = cdecl_link_func("curl_easy_header",
+        {C_POINTER, C_POINTER, C_POINTER, C_UINT, C_INT, C_POINTER}, C_INT),
+    fn_easy_nextheader     = cdecl_link_func("curl_easy_nextheader",
+        {C_POINTER, C_UINT, C_INT, C_POINTER}, C_POINTER)
+
+function decode_easyoption(atom p)
+    if p = 0 then
+        return {}
+    end if
+    sequence name = read_opt_cstr(peek_pointer(p))
+    integer id    = peek4s(p + PTR_SIZE)
+    integer typ   = peek4s(p + PTR_SIZE + 4)
+    atom flags    = peek4u(p + PTR_SIZE + 8)
+    return {name, id, typ, flags, p}
+end function
+
+public function curl_easy_option_by_id(integer id)
+    return decode_easyoption(c_func(fn_easy_option_by_id, {id}))
+end function
+
+public function curl_easy_option_by_name(sequence name)
+    atom np = allocate_string(name)
+    atom p = c_func(fn_easy_option_by_name, {np})
+    free(np)
+    return decode_easyoption(p)
+end function
+
+--**
+-- Iterates over libcurl options. Pass 0 (or the previous sequence) to start/continue.
+-- Returns {} at the end of iteration.
+public function curl_easy_option_next(object prev = 0)
+    atom prev_ptr = 0
+    if sequence(prev) then
+        if length(prev) >= EOPT_RAW_PTR then
+            prev_ptr = prev[EOPT_RAW_PTR]
+        end if
+    else
+        prev_ptr = prev
+    end if
+    return decode_easyoption(c_func(fn_easy_option_next, {prev_ptr}))
+end function
+
+function decode_header_struct(atom p)
+    if p = 0 then
+        return {}
+    end if
+    sequence name  = read_opt_cstr(peek_pointer(p))
+    sequence value = read_opt_cstr(peek_pointer(p + PTR_SIZE))
+    atom amount    = peek_pointer(p + PTR_SIZE * 2)
+    atom idx       = peek_pointer(p + PTR_SIZE * 3)
+    atom origin    = peek4u(p + PTR_SIZE * 4)
+    atom anchor    = 0
+    ifdef BITS64 then
+        anchor = peek_pointer(p + 40)
+    elsedef
+        anchor = peek_pointer(p + 20)
+    end ifdef
+    return {name, value, amount, idx, origin, anchor, p}
+end function
+
+--**
+-- Queries a specific HTTP header received by the handle.
+-- Returns {CURLHcode, {name, value, amount, index, origin, anchor, raw_ptr}} or {CURLHcode, {}}.
+public function curl_easy_header(atom curl, sequence name, atom index = 0,
+        atom origin = CURLH_HEADER, integer request = -1)
+    atom np = allocate_string(name)
+    atom hout_pp = allocate(PTR_SIZE)
+    poke_pointer(hout_pp, 0)
+
+    integer rc = c_func(fn_easy_header, {curl, np, index, origin, request, hout_pp})
+    free(np)
+
+    atom hptr = peek_pointer(hout_pp)
+    free(hout_pp)
+
+    if rc != CURLHE_OK or hptr = 0 then
+        return {rc, {}}
+    end if
+    return {rc, decode_header_struct(hptr)}
+end function
+
+--**
+-- Iterates over headers received by the handle. Pass 0 (or the previous return value) as prev.
+public function curl_easy_nextheader(atom curl, atom origin = CURLH_HEADER,
+        integer request = -1, object prev = 0)
+    atom prev_ptr = 0
+    if sequence(prev) then
+        if length(prev) >= HDR_RAW_PTR then
+            prev_ptr = prev[HDR_RAW_PTR]
+        end if
+    else
+        prev_ptr = prev
+    end if
+    return decode_header_struct(c_func(fn_easy_nextheader, {curl, origin, request, prev_ptr}))
+end function
+
+-- =============================================================================
+-- 5. Multi Interface (19 functions)
+-- =============================================================================
+
+constant
+    fn_multi_init           = cdecl_link_func("curl_multi_init", {}, C_POINTER),
+    fn_multi_cleanup        = cdecl_link_func("curl_multi_cleanup", {C_POINTER}, C_INT),
+    fn_multi_add_handle     = cdecl_link_func("curl_multi_add_handle", {C_POINTER, C_POINTER}, C_INT),
+    fn_multi_remove_handle  = cdecl_link_func("curl_multi_remove_handle", {C_POINTER, C_POINTER}, C_INT),
+    fn_multi_perform        = cdecl_link_func("curl_multi_perform", {C_POINTER, C_POINTER}, C_INT),
+    fn_multi_wait           = cdecl_link_func("curl_multi_wait",
+        {C_POINTER, C_POINTER, C_UINT, C_INT, C_POINTER}, C_INT),
+    fn_multi_poll           = cdecl_link_func("curl_multi_poll",
+        {C_POINTER, C_POINTER, C_UINT, C_INT, C_POINTER}, C_INT),
+    fn_multi_waitfds        = cdecl_link_func("curl_multi_waitfds",
+        {C_POINTER, C_POINTER, C_UINT, C_POINTER}, C_INT),
+    fn_multi_wakeup         = cdecl_link_func("curl_multi_wakeup", {C_POINTER}, C_INT),
+    fn_multi_info_read      = cdecl_link_func("curl_multi_info_read", {C_POINTER, C_POINTER}, C_POINTER),
+    fn_multi_setopt_long    = cdecl_link_func("curl_multi_setopt", {C_POINTER, C_INT, C_LONG}, C_INT),
+    fn_multi_setopt_ptr     = cdecl_link_func("curl_multi_setopt", {C_POINTER, C_INT, C_POINTER}, C_INT),
+    fn_multi_setopt_offt    = cdecl_link_func("curl_multi_setopt", {C_POINTER, C_INT, C_LONGLONG}, C_INT),
+    fn_multi_timeout        = cdecl_link_func("curl_multi_timeout", {C_POINTER, C_POINTER}, C_INT),
+    fn_multi_fdset          = cdecl_link_func("curl_multi_fdset",
+        {C_POINTER, C_POINTER, C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_multi_socket         = cdecl_link_func("curl_multi_socket",
+        {C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_multi_socket_action  = cdecl_link_func("curl_multi_socket_action",
+        {C_POINTER, C_POINTER, C_INT, C_POINTER}, C_INT),
+    fn_multi_socket_all     = cdecl_link_func("curl_multi_socket_all", {C_POINTER, C_POINTER}, C_INT),
+    fn_multi_assign         = cdecl_link_func("curl_multi_assign", {C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_multi_strerror       = cdecl_link_func("curl_multi_strerror", {C_INT}, C_POINTER),
+    fn_multi_get_handles    = cdecl_link_func("curl_multi_get_handles", {C_POINTER}, C_POINTER)
+
+public function curl_multi_init()
+    return c_func(fn_multi_init, {})
+end function
+
+public function curl_multi_cleanup(atom multi)
+    if multi = 0 then
+        return CURLM_BAD_HANDLE
+    end if
+    return c_func(fn_multi_cleanup, {multi})
+end function
+
+public function curl_multi_add_handle(atom multi, atom easy)
+    return c_func(fn_multi_add_handle, {multi, easy})
+end function
+
+public function curl_multi_remove_handle(atom multi, atom easy)
+    return c_func(fn_multi_remove_handle, {multi, easy})
+end function
+
+--**
+-- Performs pending transfer steps on handles in the multi-handle without blocking.
+-- Returns {CURLMcode, running_handles}.
+public function curl_multi_perform(atom multi)
+    atom rp = allocate(4)
+    poke4(rp, 0)
+    integer rc = c_func(fn_multi_perform, {multi, rp})
+    integer running = peek4s(rp)
+    free(rp)
+    return {rc, running}
+end function
+
+--**
+-- Waits for activity on multi-managed sockets (returns immediately if extra_fds and sockets
+-- are not ready after timeout_ms). Returns {CURLMcode, numfds}.
+public function curl_multi_wait(atom multi, integer timeout_ms = 50,
+        atom extra_fds = 0, integer extra_nfds = 0)
+    atom nfds_ptr = allocate(4)
+    poke4(nfds_ptr, 0)
+    integer rc = c_func(fn_multi_wait, {multi, extra_fds, extra_nfds, timeout_ms, nfds_ptr})
+    integer numfds = peek4s(nfds_ptr)
+    free(nfds_ptr)
+    return {rc, numfds}
+end function
+
+--**
+-- Waits for socket activity or curl_multi_wakeup() for up to timeout_ms.
+-- Returns {CURLMcode, numfds}.
+public function curl_multi_poll(atom multi, integer timeout_ms = 50,
+        atom extra_fds = 0, integer extra_nfds = 0)
+    atom nfds_ptr = allocate(4)
+    poke4(nfds_ptr, 0)
+    integer rc = c_func(fn_multi_poll, {multi, extra_fds, extra_nfds, timeout_ms, nfds_ptr})
+    integer numfds = peek4s(nfds_ptr)
+    free(nfds_ptr)
+    return {rc, numfds}
+end function
+
+--**
+-- Queries the socket descriptors of the multi handle.
+-- Returns {CURLMcode, fd_count} where ufds points to a caller-allocated buffer (or 0).
+public function curl_multi_waitfds(atom multi, atom ufds_ptr = 0, integer ufds_size = 0)
+    atom count_ptr = allocate(4)
+    poke4(count_ptr, 0)
+    integer rc = c_func(fn_multi_waitfds, {multi, ufds_ptr, ufds_size, count_ptr})
+    atom count = peek4u(count_ptr)
+    free(count_ptr)
+    return {rc, count}
+end function
+
+public function curl_multi_wakeup(atom multi)
+    return c_func(fn_multi_wakeup, {multi})
+end function
+
+--**
+-- Reads the next CURLMsg message from the multi handle queue.
+-- Returns {} if no messages are available, or {msg, easy_handle, result, msgs_in_queue}.
+public function curl_multi_info_read(atom multi)
+    atom q_ptr = allocate(4)
+    poke4(q_ptr, 0)
+    atom msg_ptr = c_func(fn_multi_info_read, {multi, q_ptr})
+    integer queued = peek4s(q_ptr)
+    free(q_ptr)
+
+    if msg_ptr = 0 then
+        return {}
+    end if
+
+    integer msg_type = peek4s(msg_ptr)
+    atom easy_handle = peek_pointer(msg_ptr + PTR_SIZE)
+    integer result   = peek4s(msg_ptr + PTR_SIZE * 2)
+    return {msg_type, easy_handle, result, queued}
+end function
+
+public function curl_multi_setopt(atom multi, integer opt, object param)
+    if opt >= 30000 and opt < 40000 then
+        return c_func(fn_multi_setopt_offt, {multi, opt, param})
+    elsif opt < 10000 then
+        return c_func(fn_multi_setopt_long, {multi, opt, param})
+    else
+        if sequence(param) then
+            atom p = alloc_bytes_cstr(param)
+            integer rc = c_func(fn_multi_setopt_ptr, {multi, opt, p})
+            free(p)
+            return rc
+        end if
+        return c_func(fn_multi_setopt_ptr, {multi, opt, param})
+    end if
+end function
+
+public function curl_multi_timeout(atom multi)
+    atom tp = allocate(PTR_SIZE)
+    poke_long(tp, -1)
+    integer rc = c_func(fn_multi_timeout, {multi, tp})
+    atom timeout_ms = peek_longs(tp)
+    free(tp)
+    return {rc, timeout_ms}
+end function
+
+public function curl_multi_fdset(atom multi, atom read_fd_set, atom write_fd_set, atom exc_fd_set)
+    atom maxfd_ptr = allocate(4)
+    poke4(maxfd_ptr, -1)
+    integer rc = c_func(fn_multi_fdset, {multi, read_fd_set, write_fd_set, exc_fd_set, maxfd_ptr})
+    integer maxfd = peek4s(maxfd_ptr)
+    free(maxfd_ptr)
+    return {rc, maxfd}
+end function
+
+public function curl_multi_socket(atom multi, atom sock)
+    atom rp = allocate(4)
+    poke4(rp, 0)
+    integer rc = c_func(fn_multi_socket, {multi, sock, rp})
+    integer running = peek4s(rp)
+    free(rp)
+    return {rc, running}
+end function
+
+public function curl_multi_socket_action(atom multi, atom sock, integer ev_bitmask)
+    atom rp = allocate(4)
+    poke4(rp, 0)
+    integer rc = c_func(fn_multi_socket_action, {multi, sock, ev_bitmask, rp})
+    integer running = peek4s(rp)
+    free(rp)
+    return {rc, running}
+end function
+
+public function curl_multi_socket_all(atom multi)
+    atom rp = allocate(4)
+    poke4(rp, 0)
+    integer rc = c_func(fn_multi_socket_all, {multi, rp})
+    integer running = peek4s(rp)
+    free(rp)
+    return {rc, running}
+end function
+
+public function curl_multi_assign(atom multi, atom sock, atom sockptr)
+    return c_func(fn_multi_assign, {multi, sock, sockptr})
+end function
+
+public function curl_multi_strerror(integer err_code)
+    return read_opt_cstr(c_func(fn_multi_strerror, {err_code}))
+end function
+
+--**
+-- Returns all easy handles currently attached to the multi handle (and frees the internal C array).
+public function curl_multi_get_handles(atom multi)
+    atom arr = c_func(fn_multi_get_handles, {multi})
+    if arr = 0 then
+        return {}
+    end if
+    sequence handles = {}
+    atom cur = arr
+    atom eh = peek_pointer(cur)
+    while eh != 0 do
+        handles = append(handles, eh)
+        cur += PTR_SIZE
+        eh = peek_pointer(cur)
+    end while
+    curl_free(arr)
+    return handles
+end function
+
+-- =============================================================================
+-- 6. Share Interface (4 functions)
+-- =============================================================================
+
+constant
+    fn_share_init        = cdecl_link_func("curl_share_init", {}, C_POINTER),
+    fn_share_cleanup     = cdecl_link_func("curl_share_cleanup", {C_POINTER}, C_INT),
+    fn_share_setopt_long = cdecl_link_func("curl_share_setopt", {C_POINTER, C_INT, C_LONG}, C_INT),
+    fn_share_setopt_ptr  = cdecl_link_func("curl_share_setopt", {C_POINTER, C_INT, C_POINTER}, C_INT),
+    fn_share_strerror    = cdecl_link_func("curl_share_strerror", {C_INT}, C_POINTER)
+
+public function curl_share_init()
+    return c_func(fn_share_init, {})
+end function
+
+public function curl_share_cleanup(atom share)
+    if share = 0 then
+        return CURLSHE_INVALID
+    end if
+    return c_func(fn_share_cleanup, {share})
+end function
+
+public function curl_share_setopt(atom share, integer opt, atom param)
+    if opt = CURLSHOPT_SHARE or opt = CURLSHOPT_UNSHARE then
+        return c_func(fn_share_setopt_long, {share, opt, param})
+    end if
+    return c_func(fn_share_setopt_ptr, {share, opt, param})
+end function
+
+public function curl_share_strerror(integer err_code)
+    return read_opt_cstr(c_func(fn_share_strerror, {err_code}))
+end function
+
+-- =============================================================================
+-- 7. MIME API (12 functions)
+-- =============================================================================
+
+constant
+    fn_mime_init     = cdecl_link_func("curl_mime_init", {C_POINTER}, C_POINTER),
+    pr_mime_free     = cdecl_link_proc("curl_mime_free", {C_POINTER}),
+    fn_mime_addpart  = cdecl_link_func("curl_mime_addpart", {C_POINTER}, C_POINTER),
+    fn_mime_name     = cdecl_link_func("curl_mime_name", {C_POINTER, C_POINTER}, C_INT),
+    fn_mime_data     = cdecl_link_func("curl_mime_data", {C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_mime_data_cb  = cdecl_link_func("curl_mime_data_cb",
+        {C_POINTER, C_LONGLONG, C_POINTER, C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_mime_filedata = cdecl_link_func("curl_mime_filedata", {C_POINTER, C_POINTER}, C_INT),
+    fn_mime_filename = cdecl_link_func("curl_mime_filename", {C_POINTER, C_POINTER}, C_INT),
+    fn_mime_type     = cdecl_link_func("curl_mime_type", {C_POINTER, C_POINTER}, C_INT),
+    fn_mime_encoder  = cdecl_link_func("curl_mime_encoder", {C_POINTER, C_POINTER}, C_INT),
+    fn_mime_headers  = cdecl_link_func("curl_mime_headers", {C_POINTER, C_POINTER, C_INT}, C_INT),
+    fn_mime_subparts = cdecl_link_func("curl_mime_subparts", {C_POINTER, C_POINTER}, C_INT)
+
+public function curl_mime_init(atom curl)
+    return c_func(fn_mime_init, {curl})
+end function
+
+public procedure curl_mime_free(atom mime)
+    if mime != 0 then
+        c_proc(pr_mime_free, {mime})
+    end if
+end procedure
+
+public function curl_mime_addpart(atom mime)
+    return c_func(fn_mime_addpart, {mime})
+end function
+
+public function curl_mime_name(atom part, sequence name)
+    atom p = allocate_string(name)
+    integer rc = c_func(fn_mime_name, {part, p})
+    free(p)
+    return rc
+end function
+
+--**
+-- Sets MIME part data while preserving binary bytes (including embedded NUL bytes).
+public function curl_mime_data(atom part, sequence data)
+    integer n = length(data)
+    atom p = allocate(n + 1)
+    if n > 0 then
+        poke(p, data)
+    end if
+    poke(p + n, 0)
+    integer rc = c_func(fn_mime_data, {part, p, n})
+    free(p)
+    return rc
+end function
+
+public function curl_mime_data_cb(atom part, atom datasize, atom readfunc,
+        atom seekfunc = 0, atom freefunc = 0, atom arg = 0)
+    return c_func(fn_mime_data_cb, {part, datasize, readfunc, seekfunc, freefunc, arg})
+end function
+
+public function curl_mime_filedata(atom part, sequence filename)
+    atom p = allocate_string(filename)
+    integer rc = c_func(fn_mime_filedata, {part, p})
+    free(p)
+    return rc
+end function
+
+public function curl_mime_filename(atom part, object filename)
+    if atom(filename) and filename = 0 then
+        return c_func(fn_mime_filename, {part, 0})
+    end if
+    atom p = allocate_string(filename)
+    integer rc = c_func(fn_mime_filename, {part, p})
+    free(p)
+    return rc
+end function
+
+public function curl_mime_type(atom part, object mimetype)
+    if atom(mimetype) and mimetype = 0 then
+        return c_func(fn_mime_type, {part, 0})
+    end if
+    atom p = allocate_string(mimetype)
+    integer rc = c_func(fn_mime_type, {part, p})
+    free(p)
+    return rc
+end function
+
+public function curl_mime_encoder(atom part, object encoding)
+    if atom(encoding) and encoding = 0 then
+        return c_func(fn_mime_encoder, {part, 0})
+    end if
+    atom p = allocate_string(encoding)
+    integer rc = c_func(fn_mime_encoder, {part, p})
+    free(p)
+    return rc
+end function
+
+public function curl_mime_headers(atom part, atom headers_slist, integer take_ownership = 0)
+    return c_func(fn_mime_headers, {part, headers_slist, take_ownership})
+end function
+
+public function curl_mime_subparts(atom part, atom subparts_mime)
+    return c_func(fn_mime_subparts, {part, subparts_mime})
+end function
+
+-- =============================================================================
+-- 8. URL API (6 functions)
+-- =============================================================================
+
+constant
+    fn_url          = cdecl_link_func("curl_url", {}, C_POINTER),
+    pr_url_cleanup  = cdecl_link_proc("curl_url_cleanup", {C_POINTER}),
+    fn_url_dup      = cdecl_link_func("curl_url_dup", {C_POINTER}, C_POINTER),
+    fn_url_get      = cdecl_link_func("curl_url_get", {C_POINTER, C_INT, C_POINTER, C_UINT}, C_INT),
+    fn_url_set      = cdecl_link_func("curl_url_set", {C_POINTER, C_INT, C_POINTER, C_UINT}, C_INT),
+    fn_url_strerror = cdecl_link_func("curl_url_strerror", {C_INT}, C_POINTER)
+
+public function curl_url()
+    return c_func(fn_url, {})
+end function
+
+public procedure curl_url_cleanup(atom url_handle)
+    if url_handle != 0 then
+        c_proc(pr_url_cleanup, {url_handle})
+    end if
+end procedure
+
+public function curl_url_dup(atom url_handle)
+    return c_func(fn_url_dup, {url_handle})
+end function
+
+--**
+-- Extracts a URL component (CURLUPART_*). Returns {CURLUcode, string_value}.
+public function curl_url_get(atom url_handle, integer what, atom flags = 0)
+    atom out_pp = allocate(PTR_SIZE)
+    poke_pointer(out_pp, 0)
+    integer rc = c_func(fn_url_get, {url_handle, what, out_pp, flags})
+    atom str_ptr = peek_pointer(out_pp)
+    free(out_pp)
+
+    sequence val = ""
+    if str_ptr != 0 then
+        if rc = CURLUE_OK then
+            val = peek_string(str_ptr)
+        end if
+        curl_free(str_ptr)
+    end if
+    return {rc, val}
+end function
+
+--**
+-- Sets a URL component (CURLUPART_*). Pass 0 to clear the part or a string to set it.
+public function curl_url_set(atom url_handle, integer what, object part, atom flags = 0)
+    if atom(part) and part = 0 then
+        return c_func(fn_url_set, {url_handle, what, 0, flags})
+    end if
+    atom p = allocate_string(part)
+    integer rc = c_func(fn_url_set, {url_handle, what, p, flags})
+    free(p)
+    return rc
+end function
+
+public function curl_url_strerror(integer err_code)
+    return read_opt_cstr(c_func(fn_url_strerror, {err_code}))
+end function
+
+-- =============================================================================
+-- 9. WebSockets API (3 functions)
+-- =============================================================================
+
+constant
+    fn_ws_recv = cdecl_link_func("curl_ws_recv",
+        {C_POINTER, C_POINTER, C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_ws_send = cdecl_link_func("curl_ws_send",
+        {C_POINTER, C_POINTER, C_POINTER, C_POINTER, C_LONGLONG, C_UINT}, C_INT),
+    fn_ws_meta = cdecl_link_func("curl_ws_meta", {C_POINTER}, C_POINTER)
+
+function decode_ws_frame(atom p)
+    if p = 0 then
+        return {}
+    end if
+    integer age       = peek4s(p + 0)
+    integer flags     = peek4s(p + 4)
+    atom offset       = peek8s(p + 8)
+    atom bytesleft    = peek8s(p + 16)
+    atom frame_len    = peek_pointer(p + 24)
+    return {age, flags, offset, bytesleft, frame_len}
+end function
+
+--**
+-- Receives a WebSocket frame on a connection opened with CURLOPT_CONNECT_ONLY = 2.
+-- Returns {CURLcode, received_bytes, ws_meta}.
+public function curl_ws_recv(atom curl, integer max_len = 65536)
+    if max_len <= 0 then
+        return {CURLE_BAD_FUNCTION_ARGUMENT, "", {}}
+    end if
+    atom buf = allocate(max_len)
+    atom n_ptr = allocate(PTR_SIZE)
+    atom meta_pp = allocate(PTR_SIZE)
+    poke_pointer(n_ptr, 0)
+    poke_pointer(meta_pp, 0)
+
+    integer rc = c_func(fn_ws_recv, {curl, buf, max_len, n_ptr, meta_pp})
+    atom nread = peek_pointer(n_ptr)
+    atom meta_ptr = peek_pointer(meta_pp)
+    free(n_ptr)
+    free(meta_pp)
+
+    sequence data = ""
+    if rc = CURLE_OK and nread > 0 then
+        data = peek({buf, nread})
+    end if
+    free(buf)
+    return {rc, data, decode_ws_frame(meta_ptr)}
+end function
+
+--**
+-- Sends WebSocket data. Returns {CURLcode, bytes_sent}.
+public function curl_ws_send(atom curl, sequence data, atom flags = CURLWS_TEXT, atom fragsize = 0)
+    integer n = length(data)
+    atom buf = allocate(n + 1)
+    if n > 0 then
+        poke(buf, data)
+    end if
+    poke(buf + n, 0)
+
+    atom sent_ptr = allocate(PTR_SIZE)
+    poke_pointer(sent_ptr, 0)
+
+    integer rc = c_func(fn_ws_send, {curl, buf, n, sent_ptr, fragsize, flags})
+    atom nsent = peek_pointer(sent_ptr)
+    free(sent_ptr)
+    free(buf)
+    return {rc, nsent}
+end function
+
+public function curl_ws_meta(atom curl)
+    return decode_ws_frame(c_func(fn_ws_meta, {curl}))
+end function
+
+-- =============================================================================
+-- 10. HTTP/2 Server Push Headers (2 functions)
+-- =============================================================================
+
+constant
+    fn_pushheader_bynum  = cdecl_link_func("curl_pushheader_bynum", {C_POINTER, C_POINTER}, C_POINTER),
+    fn_pushheader_byname = cdecl_link_func("curl_pushheader_byname", {C_POINTER, C_POINTER}, C_POINTER)
+
+public function curl_pushheader_bynum(atom push_headers, atom num)
+    return read_opt_cstr(c_func(fn_pushheader_bynum, {push_headers, num}))
+end function
+
+public function curl_pushheader_byname(atom push_headers, sequence name)
+    atom np = allocate_string(name)
+    atom rp = c_func(fn_pushheader_byname, {push_headers, np})
+    free(np)
+    return read_opt_cstr(rp)
+end function
+
+-- =============================================================================
+-- 11. Legacy API (Form & Escape/Unescape) (5 functions)
+-- =============================================================================
+
+constant
+    pr_formfree = cdecl_link_proc("curl_formfree", {C_POINTER}),
+    fn_formget  = cdecl_link_func("curl_formget", {C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_escape   = cdecl_link_func("curl_escape", {C_POINTER, C_INT}, C_POINTER),
+    fn_unescape = cdecl_link_func("curl_unescape", {C_POINTER, C_INT}, C_POINTER)
+
+-- Registers curl_formadd with typed varargs for up to 6 {CURLFORM_*, value} pairs + CURLFORM_END
+constant
+    fn_formadd_1 = cdecl_link_func("curl_formadd",
+        {C_POINTER, C_POINTER, C_INT, C_POINTER, C_INT}, C_INT),
+    fn_formadd_2 = cdecl_link_func("curl_formadd",
+        {C_POINTER, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT}, C_INT),
+    fn_formadd_3 = cdecl_link_func("curl_formadd",
+        {C_POINTER, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT}, C_INT),
+    fn_formadd_4 = cdecl_link_func("curl_formadd",
+        {C_POINTER, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT}, C_INT),
+    fn_formadd_5 = cdecl_link_func("curl_formadd",
+        {C_POINTER, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT}, C_INT),
+    fn_formadd_6 = cdecl_link_func("curl_formadd",
+        {C_POINTER, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT, C_POINTER, C_INT}, C_INT)
+
+--**
+-- Legacy wrapper for curl_formadd() (prefer curl_mime_* for new code).
+-- Accepts {httppost_pp, lastpost_pp} pointers and a list of {{CURLFORM_*, value}, ...} pairs (1..6 pairs).
+public function curl_formadd(atom first_pp, atom last_pp, sequence pairs)
+    integer npairs = length(pairs)
+    if npairs < 1 or npairs > 6 then
+        error:crash("curl_formadd supports 1 to 6 {CURLFORM_*, value} pairs (got %d)", {npairs})
+    end if
+
+    sequence c_args = {first_pp, last_pp}
+    sequence tmp_allocs = {}
+
+    for i = 1 to npairs do
+        integer opt_code = pairs[i][1]
+        object val = pairs[i][2]
+        c_args = append(c_args, opt_code)
+        if sequence(val) then
+            atom sp = alloc_bytes_cstr(val)
+            tmp_allocs = append(tmp_allocs, sp)
+            c_args = append(c_args, sp)
+        else
+            c_args = append(c_args, val)
+        end if
+    end for
+    c_args = append(c_args, CURLFORM_END)
+
+    integer rc = CURL_FORMADD_UNKNOWN_OPTION
+    switch npairs do
+        case 1 then rc = c_func(fn_formadd_1, c_args)
+        case 2 then rc = c_func(fn_formadd_2, c_args)
+        case 3 then rc = c_func(fn_formadd_3, c_args)
+        case 4 then rc = c_func(fn_formadd_4, c_args)
+        case 5 then rc = c_func(fn_formadd_5, c_args)
+        case 6 then rc = c_func(fn_formadd_6, c_args)
+        case else rc = CURL_FORMADD_UNKNOWN_OPTION
+    end switch
+
+    for i = 1 to length(tmp_allocs) do
+        free(tmp_allocs[i])
+    end for
+    return rc
+end function
+
+public procedure curl_formfree(atom form)
+    if form != 0 then
+        c_proc(pr_formfree, {form})
+    end if
+end procedure
+
+public function curl_formget(atom form, atom arg, atom append_cb)
+    return c_func(fn_formget, {form, arg, append_cb})
+end function
+
+public function curl_escape(sequence text)
+    integer n = length(text)
+    if n = 0 then
+        return ""
+    end if
+    atom sp = allocate(n)
+    poke(sp, text)
+    atom rp = c_func(fn_escape, {sp, n})
+    free(sp)
+    if rp = 0 then
+        return ""
+    end if
+    sequence res = peek_string(rp)
+    curl_free(rp)
+    return res
+end function
+
+public function curl_unescape(sequence text)
+    integer n = length(text)
+    if n = 0 then
+        return ""
+    end if
+    atom sp = allocate(n)
+    poke(sp, text)
+    atom rp = c_func(fn_unescape, {sp, n})
+    free(sp)
+    if rp = 0 then
+        return ""
+    end if
+    sequence res = peek_string(rp)
+    curl_free(rp)
+    return res
+end function
+
+-- =============================================================================
+-- 12. curl_m*printf Family (10 functions)
+--     Note: for formatting in Euphoria, prefer native printf() / sprintf().
+-- =============================================================================
+
+constant
+    fn_mprintf     = cdecl_link_func("curl_mprintf", {C_POINTER, C_POINTER}, C_INT),
+    fn_mfprintf    = cdecl_link_func("curl_mfprintf", {C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_msprintf    = cdecl_link_func("curl_msprintf", {C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_msnprintf   = cdecl_link_func("curl_msnprintf", {C_POINTER, C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_maprintf    = cdecl_link_func("curl_maprintf", {C_POINTER, C_POINTER}, C_POINTER),
+    fn_mvprintf    = cdecl_link_func("curl_mvprintf", {C_POINTER, C_POINTER}, C_INT),
+    fn_mvfprintf   = cdecl_link_func("curl_mvfprintf", {C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_mvsprintf   = cdecl_link_func("curl_mvsprintf", {C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_mvsnprintf  = cdecl_link_func("curl_mvsnprintf", {C_POINTER, C_POINTER, C_POINTER, C_POINTER}, C_INT),
+    fn_mvaprintf   = cdecl_link_func("curl_mvaprintf", {C_POINTER, C_POINTER}, C_POINTER)
+
+constant FMT_STR_PTR = allocate_string("%s")
+
+public function curl_mprintf(sequence text)
+    atom tp = allocate_string(text)
+    integer rc = c_func(fn_mprintf, {FMT_STR_PTR, tp})
+    free(tp)
+    return rc
+end function
+
+public function curl_mfprintf(atom c_file_ptr, sequence text)
+    atom tp = allocate_string(text)
+    integer rc = c_func(fn_mfprintf, {c_file_ptr, FMT_STR_PTR, tp})
+    free(tp)
+    return rc
+end function
+
+public function curl_msprintf(atom out_buf, sequence text)
+    atom tp = allocate_string(text)
+    integer rc = c_func(fn_msprintf, {out_buf, FMT_STR_PTR, tp})
+    free(tp)
+    return rc
+end function
+
+public function curl_msnprintf(atom out_buf, atom max_len, sequence text)
+    atom tp = allocate_string(text)
+    integer rc = c_func(fn_msnprintf, {out_buf, max_len, FMT_STR_PTR, tp})
+    free(tp)
+    return rc
+end function
+
+public function curl_maprintf(sequence text)
+    atom tp = allocate_string(text)
+    atom rp = c_func(fn_maprintf, {FMT_STR_PTR, tp})
+    free(tp)
+    if rp = 0 then
+        return ""
+    end if
+    sequence res = peek_string(rp)
+    curl_free(rp)
+    return res
+end function
+
+public function curl_mvprintf(sequence fmt, atom va_args_ptr = 0)
+    atom fp = allocate_string(fmt)
+    integer rc = c_func(fn_mvprintf, {fp, va_args_ptr})
+    free(fp)
+    return rc
+end function
+
+public function curl_mvfprintf(atom c_file_ptr, sequence fmt, atom va_args_ptr = 0)
+    atom fp = allocate_string(fmt)
+    integer rc = c_func(fn_mvfprintf, {c_file_ptr, fp, va_args_ptr})
+    free(fp)
+    return rc
+end function
+
+public function curl_mvsprintf(atom out_buf, sequence fmt, atom va_args_ptr = 0)
+    atom fp = allocate_string(fmt)
+    integer rc = c_func(fn_mvsprintf, {out_buf, fp, va_args_ptr})
+    free(fp)
+    return rc
+end function
+
+public function curl_mvsnprintf(atom out_buf, atom max_len, sequence fmt, atom va_args_ptr = 0)
+    atom fp = allocate_string(fmt)
+    integer rc = c_func(fn_mvsnprintf, {out_buf, max_len, fp, va_args_ptr})
+    free(fp)
+    return rc
+end function
+
+public function curl_mvaprintf(sequence fmt, atom va_args_ptr = 0)
+    atom fp = allocate_string(fmt)
+    atom rp = c_func(fn_mvaprintf, {fp, va_args_ptr})
+    free(fp)
+    if rp = 0 then
+        return ""
+    end if
+    sequence res = peek_string(rp)
+    curl_free(rp)
+    return res
+end function
+
+-- =============================================================================
+-- 13. Modern Synchronous Helpers
+-- =============================================================================
+
+map perform_ex_buffers = map:new()
+
+function easy_ex_write_cb(atom bufferp, atom size, atom nmemb, atom curl)
+    atom total = size * nmemb
+    if total > 0 then
+        sequence chunk = peek({bufferp, total})
+        sequence prev = map:get(perform_ex_buffers, curl, "")
+        map:put(perform_ex_buffers, curl, prev & chunk)
+    end if
+    return total
+end function
+
+constant EASY_EX_WRITE_CB = curl_callback(routine_id("easy_ex_write_cb"))
+
+--**
+-- Performs a synchronous transfer, capturing the response body per handle.
+-- Returns {CURLcode, response_body}.
+public function curl_easy_perform_ex(atom curl)
+    map:put(perform_ex_buffers, curl, "")
+
+    integer rc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, EASY_EX_WRITE_CB)
+    if rc != CURLE_OK then
+        map:remove(perform_ex_buffers, curl)
+        return {rc, ""}
+    end if
+
+    rc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, curl)
+    if rc != CURLE_OK then
+        map:remove(perform_ex_buffers, curl)
+        return {rc, ""}
+    end if
+
+    rc = curl_easy_perform(curl)
+    sequence body = map:get(perform_ex_buffers, curl, "")
+    map:remove(perform_ex_buffers, curl)
+
+    return {rc, body}
+end function
+
+--**
+-- Synchronously downloads a URL into memory or directly to a file on disk.
+-- If filename != "", writes to the file and returns CURLcode.
+-- If filename = "", returns {CURLcode, body}.
+public function curl_easy_get_file(sequence url, sequence proxy = "", sequence filename = "")
+    atom curl = curl_easy_init()
+    if curl = 0 then
+        if length(filename) > 0 then
+            return CURLE_FAILED_INIT
+        end if
+        return {CURLE_FAILED_INIT, ""}
+    end if
+
+    integer rc = curl_easy_setopt(curl, CURLOPT_URL, url)
+    if rc = CURLE_OK and length(proxy) > 0 then
+        rc = curl_easy_setopt(curl, CURLOPT_PROXY, proxy)
+    end if
+    if rc = CURLE_OK then
+        rc = curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1)
+    end if
+    ifdef WINDOWS then
+        if rc = CURLE_OK then
+            rc = curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA)
+        end if
+    end ifdef
+
+    if rc != CURLE_OK then
+        curl_easy_cleanup(curl)
+        if length(filename) > 0 then
+            return rc
+        end if
+        return {rc, ""}
+    end if
+
+    sequence res = curl_easy_perform_ex(curl)
+    curl_easy_cleanup(curl)
+
+    rc = res[1]
+    if rc != CURLE_OK then
+        if length(filename) > 0 then
+            return rc
+        end if
+        return res
+    end if
+
+    if length(filename) > 0 then
+        integer fn = open(filename, "wb")
+        if fn = -1 then
+            return CURLE_CANT_OPEN_FILE
+        end if
+        puts(fn, res[2])
+        close(fn)
+        return CURLE_OK
+    end if
+
+    return res
+end function
+
+--**
+-- Converts two 32-bit integers/atoms (little-endian: lo, hi) into an IEEE-754 double.
+public function atoms_to_double(atom lo, atom hi)
+    return float64_to_atom(int_to_bytes(lo) & int_to_bytes(hi))
+end function
